@@ -1,5 +1,6 @@
 use esp_idf_svc::hal::peripherals::Peripherals;
 use log::*;
+use std::default::Default;
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +27,24 @@ fn main() -> Result<()> {
 
     let ps = Peripherals::take().unwrap();
     let pins = ps.pins;
+
+    unsafe {
+        use std::ptr::null;
+
+        let config = esp_idf_sys::tinyusb_config_t {
+            // string_descriptor: NULL,
+            // string_descriptor_count: todo!(),
+            external_phy: false,
+            // configuration_descriptor: null(),
+            // self_powered: false,
+            ..Default::default()
+        };
+
+        esp_idf_sys::tinyusb_driver_install(&config);
+
+        // https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32s3/api-reference/peripherals/usb_device.html
+        // TODO: https://github.com/espressif/esp-idf/blob/v5.1.2/examples/peripherals/usb/device/tusb_serial_device/main/tusb_serial_device_main.c
+    }
 
     let mut led = {
         use esp_idf_svc::hal::rmt;

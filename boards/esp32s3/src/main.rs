@@ -1,20 +1,68 @@
+use anyhow::Result;
+use esp_idf_svc::hal::gpio::AnyIOPin;
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::uart;
+use esp_idf_svc::hal::units::Hertz;
 use log::*;
-use std::default::Default;
 use std::thread;
 use std::time::Duration;
 
-pub enum Light {
-    Off,
-    On(Color),
+use schema::{Color, Light};
+
+// TODO: use USB
+// unsafe {
+//     use std::ptr::null;
+//     use std::default::Default;
+
+//     let config = esp_idf_sys::tinyusb_config_t {
+//         // string_descriptor: NULL,
+//         // string_descriptor_count: todo!(),
+//         external_phy: false,
+//         // configuration_descriptor: null(),
+//         // self_powered: false,
+//         ..Default::default()
+//     };
+
+//     esp_idf_sys::tinyusb_driver_install(&config);
+
+//     // https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32s3/api-reference/peripherals/usb_device.html
+//     // TODO: https://github.com/espressif/esp-idf/blob/v5.1.2/examples/peripherals/usb/device/tusb_serial_device/main/tusb_serial_device_main.c
+// }
+
+mod comms {
+    use postcard::accumulator::{CobsAccumulator, FeedResult};
+    use serde::Deserialize;
+
+    pub struct Accumulator<const N: usize> {
+        cobs_buf: CobsAccumulator<N>,
+    }
+
+    impl<const N: usize> Accumulator<N> {
+        pub fn new() -> Self {
+            Self {
+                cobs_buf: CobsAccumulator::new(),
+            }
+        }
+        pub fn feed<T: for<'a> Deserialize<'a>>(&mut self, data: &[u8]) -> Option<T> {
+            let mut window = &data[..];
+            let mut res = None;
+
+            while !window.is_empty() {
+                window = match self.cobs_buf.feed::<T>(&window) {
+                    FeedResult::Consumed => break,
+                    FeedResult::OverFull(new_window) => new_window,
+                    FeedResult::DeserError(new_window) => new_window,
+                    FeedResult::Success { data, remaining } => {
+                        res = Some(data);
+                        remaining
+                    }
+                };
+            }
+            res
+        }
+    }
 }
 
-pub struct Color {
-    r: u8,
-    g: u8,
-    b: u8,
-}
-use anyhow::Result;
 fn main() -> Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
@@ -27,24 +75,6 @@ fn main() -> Result<()> {
 
     let ps = Peripherals::take().unwrap();
     let pins = ps.pins;
-
-    unsafe {
-        use std::ptr::null;
-
-        let config = esp_idf_sys::tinyusb_config_t {
-            // string_descriptor: NULL,
-            // string_descriptor_count: todo!(),
-            external_phy: false,
-            // configuration_descriptor: null(),
-            // self_powered: false,
-            ..Default::default()
-        };
-
-        esp_idf_sys::tinyusb_driver_install(&config);
-
-        // https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32s3/api-reference/peripherals/usb_device.html
-        // TODO: https://github.com/espressif/esp-idf/blob/v5.1.2/examples/peripherals/usb/device/tusb_serial_device/main/tusb_serial_device_main.c
-    }
 
     let mut led = {
         use esp_idf_svc::hal::rmt;
@@ -90,7 +120,40 @@ fn main() -> Result<()> {
 
     led(&Light::On(Color { r: 255, g: 0, b: 0 }));
 
+    let mut maybe_read = {
+        let uart = uart::UartDriver::new(
+            ps.uart1,
+            pins.gpio17,
+            pins.gpio18,
+            Option::<AnyIOPin>::None,
+            Option::<AnyIOPin>::None,
+            &uart::config::Config::new().baudrate(Hertz(115_200)),
+        )
+        .unwrap();
+
+        let mut acc = comms::Accumulator::<256>::new();
+        let mut raw_buf = [0u8; 32];
+
+        move || {
+            while let Ok(ct) = uart.read(&mut raw_buf, esp_idf_svc::hal::delay::NON_BLOCK) {
+                if ct == 0 {
+                    break;
+                }
+
+                if let Some(x) = acc.feed::<Light>(&raw_buf) {
+                    return Some(x);
+                }
+            }
+            None
+        }
+    };
+
     loop {
+        if let Some(x) = maybe_read() {
+            info!("{:?}", x);
+            led(&x);
+        }
+
         thread::sleep(Duration::from_millis(100));
     }
 }

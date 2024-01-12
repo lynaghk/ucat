@@ -1,2 +1,6 @@
 .cargo-installed/*
 target/*
+
+# Added by cargo
+
+/target

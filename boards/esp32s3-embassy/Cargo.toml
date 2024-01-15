@@ -5,6 +5,8 @@ authors = ["Kevin J. Lynagh <kevin@keminglabs.com>"]
 edition = "2021"
 
 [dependencies]
+ucat = { path = "../../" }
+
 esp32s3-hal = { version = "0.14", features = [] }
 esp-hal-common = { version = "0.14", features = ["async", "esp32s3", "embassy", "embassy-executor-thread", "embassy-time-timg0"] }
 

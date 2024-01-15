@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel, signal::Signal};
 use embassy_time::{Duration, Timer};
 use esp32s3_hal::{
     clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, Delay, Rmt, IO,
@@ -12,6 +13,7 @@ use esp_hal_common::{
     peripherals::UART1,
     Uart, UartRx, UartTx,
 };
+use static_cell::make_static;
 
 use log::*;
 
@@ -58,9 +60,6 @@ async fn led(rmt: Rmt<'static>, pin: GpioPin<Unknown, 38>) {
     }
 }
 
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
-use static_cell::make_static;
-
 // rx_fifo_full_threshold. Interrupt will be triggered after this many bytes are read.
 const READ_BUF_SIZE: usize = 8;
 
@@ -78,9 +77,7 @@ async fn writer(mut tx: UartTx<'static, UART1>, signal: &'static Signal<NoopRawM
 
 #[embassy_executor::task]
 async fn reader(mut rx: UartRx<'static, UART1>, signal: &'static Signal<NoopRawMutex, usize>) {
-    const MAX_BUFFER_SIZE: usize = 10 * READ_BUF_SIZE + 16;
-
-    let mut rbuf: [u8; MAX_BUFFER_SIZE] = [0u8; MAX_BUFFER_SIZE];
+    let mut rbuf = [0u8; ucat::MAX_FRAME_SIZE];
     let mut offset = 0;
     loop {
         let r = embedded_io_async::Read::read(&mut rx, &mut rbuf[offset..]).await;
@@ -93,6 +90,23 @@ async fn reader(mut rx: UartRx<'static, UART1>, signal: &'static Signal<NoopRawM
             }
             Err(e) => error!("RX Error: {:?}", e),
         }
+    }
+}
+
+type FrameChannel = &'static Channel<NoopRawMutex, ucat::Frame, 1>;
+
+#[embassy_executor::task]
+async fn comms(upstream: FrameChannel, downstream: FrameChannel) {
+    // TODO: check if actually at end
+    let mut end = true;
+
+    //downstream.try_receive()
+
+    //    let mut state = Init;
+
+    loop {
+        let f = upstream.receive().await;
+        info!("msg  {:?}", f.message);
     }
 }
 
@@ -150,5 +164,9 @@ async fn main(spawner: embassy_executor::Spawner) {
 
         spawner.spawn(reader(rx, &signal)).ok();
         spawner.spawn(writer(tx, &signal)).ok();
+
+        let upstream = &*make_static!(Channel::new());
+        let downstream = &*make_static!(Channel::new());
+        spawner.spawn(comms(upstream, downstream)).ok();
     }
 }

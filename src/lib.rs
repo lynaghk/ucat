@@ -1,13 +1,21 @@
 #![no_std]
 
+pub const MAX_FRAME_SIZE: usize = 2048;
+
 pub use heapless::String;
 
+#[derive(Debug)]
 pub struct GroupAddress(u8);
+
+#[derive(Debug)]
 pub struct DeviceAddress(i16);
+
+#[derive(Debug)]
 pub struct DeviceInfo {
     pub name: String<64>,
 }
 
+#[derive(Debug)]
 pub enum Message {
     Enumerate,
     Query(DeviceAddress),
@@ -16,6 +24,7 @@ pub enum Message {
     ProcessUpdate(GroupAddress),
 }
 
+#[derive(Debug)]
 pub struct Frame {
     pub message: Message,
     pub working_count: u16,

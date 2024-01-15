@@ -8,6 +8,16 @@ cargo install --locked --root ".cargo-installed/" --version 2.1.0 espflash
 espup install --targets esp32s3,esp32c3
 
 
+
+## Roadmap
+
+### V0
+
+- nostd ucat device library
+- proof of concept networking over UART
+- control LEDs on three esp32s3 via eui
+- device latency test / protocol
+
 ## Notes
 
 to generate cargo demo project
@@ -67,3 +77,6 @@ Frame
   - data length - u16 (should be u11?)
   - data - ??
   - CRC - u32
+
+
+Also looked into stm32 "passthrough" DMA --- seems like it'll be tricker than I expected, since the DMA peripheral requires a number of bytes to transfer --- so I'd need to setup a buffer and do a bit of CPU intervention to actually count the bytes transferred and handle the remainder.

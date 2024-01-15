@@ -1,9 +1,15 @@
-pub struct GroupAddress(u16);
+#![no_std]
+
+pub use heapless::String;
+
+pub struct GroupAddress(u8);
 pub struct DeviceAddress(i16);
-pub struct DeviceCount(u16);
+pub struct DeviceInfo {
+    pub name: String<64>,
+}
 
 pub enum Message {
-    Enumerate(DeviceCount),
+    Enumerate,
     Query(DeviceAddress),
     QueryResponse(DeviceInfo),
     Initialize(DeviceAddress, GroupAddress),
@@ -11,7 +17,7 @@ pub enum Message {
 }
 
 pub struct Frame {
-    pub command: Command,
+    pub message: Message,
     pub working_count: u16,
     pub crc: u32,
 }

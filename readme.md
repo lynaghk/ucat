@@ -18,7 +18,14 @@ rust-analyzer must be installed *without* rustup, otherwise there will be toolch
 
 https://github.com/udoprog/bittle for bitsets?
 
+
 ## Log
+### Jan 15 - embassy impl
+cargo generate esp-rs/esp-template
+
+Got smart led example working pretty quickly. Binary size is *way* smaller than esp-idf, much faster to flash the board. This seems like the way to go.
+
+
 ### Jan 12 - getting started.
 
 Decided to start with UART for simplicity.

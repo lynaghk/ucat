@@ -1,0 +1,13 @@
+[package]
+name = "esp32s3-embassy"
+version = "0.1.0"
+authors = ["Kevin J. Lynagh <kevin@keminglabs.com>"]
+edition = "2021"
+
+[dependencies]
+esp32s3-hal = "0.14"
+esp-backtrace = { version = "0.10.0", features = ["esp32s3", "panic-handler", "exception-handler", "print-uart"] }
+esp-println = { version = "0.8.0", features = ["esp32s3", "log"] }
+log = { version = "0.4" }
+esp-hal-smartled = { version = "0.7", features = ["esp32s3"] }
+smart-leds = "0.3"

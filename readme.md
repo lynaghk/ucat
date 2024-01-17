@@ -30,6 +30,39 @@ https://github.com/udoprog/bittle for bitsets?
 
 
 ## Log
+### Jan 17 - continued uart echoing
+
+Guess it's time to learn about futures and esp32 interrupts more myself.
+Here's the plan for implementing echo:
+
+- use bbqueue to pass data from rx to tx
+- set fifo empty/full sizes to be half the buffer sizes
+- rx task uses embedded io read
+- tx task reads up to tx fifo length from bbqueue, writes it and awaits fifo half empty interrupt to do it again --- ohh, I can use embedded async write_all for this too.
+
+
+
+
+### Jan 16 - run into embassy esp32 uart gaps
+
+esp32 has a UART Idle interrupt.
+I was hoping to use this for framing my messages.
+
+However, on esp32 embedded_io_async's read method blocks until a UART interrupt AND at least one byte is ready.
+
+asked on matrix https://matrix.to/#/!LdaNPfUfvefOLewEIM:matrix.org/$yNkeQFSt-U57Kexv64v5TzP1_M0bFTHbtpO8TLTqDdM?via=matrix.org&via=mozilla.org&via=arcticfoxes.net
+
+Should I avoid the embedded_io_async methods and construct my own UartRxFuture to await and call drain_fifo myself? Or is there an entirely different way to go about this that would be nicer?
+
+
+esp-hal/esp-hal-common/src/uart.rs at a23d6a05a6ae91c4a3c436b25919ede86b35683a · esp-rs/esp-hal - GitHub
+no_std Hardware Abstraction Layers for ESP32 microcontrollers - esp-rs/esp-hal
+lynaghk
+Ah, UartRxFuture is not public, so I guess that's not an option. Is there another way I could accomplish this using the existing esp-hal, or do I need to try implementing my own future using interrupt handlers?
+lynaghk
+Looking at this PR and having a harder think, I don't think I'll get stuck; the idle interrupt will wake the read future and it'll return data. That said, I don't see a way for my task to know if it was the idle interrupt or the max fifo size interrupt that polled it. I was hoping to use the idle frame for, uh, framing. I guess I could check the length of the returned data and see if it's equal to (or larger than?) the max fifo size. That still seems unreliable in the case where the message is a multiple of max fifo size, though.
+
+
 ### Jan 15 - embassy impl
 cargo generate esp-rs/esp-template
 

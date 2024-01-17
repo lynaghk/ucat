@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ucat = { path = "../" }
 anyhow = "*"
+crc = "3.0.1"
+postcard = { version = "1.0.8", features = ["use-std"] }
 serialport = "4.3.0"

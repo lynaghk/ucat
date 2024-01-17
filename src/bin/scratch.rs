@@ -1,6 +1,6 @@
-#[derive(
-    Debug, serde::Serialize, serde::Deserialize, postcard::experimental::max_size::MaxSize,
-)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, postcard::experimental::max_size::MaxSize)]
 pub struct Color {
     pins: [bool; 3],
 }
@@ -15,6 +15,6 @@ pub fn main() {
     // )
     // .unwrap();
     // dbg!(v.len());
-    use postcard::experimental::max_size::MaxSize;
-    dbg!(Color::POSTCARD_MAX_SIZE);
+    // use postcard::experimental::max_size::MaxSize;
+    // dbg!(Color::POSTCARD_MAX_SIZE);
 }

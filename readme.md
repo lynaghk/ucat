@@ -28,8 +28,39 @@ rust-analyzer must be installed *without* rustup, otherwise there will be toolch
 
 https://github.com/udoprog/bittle for bitsets?
 
+esp32s3 has UART_LOOPBACK in hardware --- could use this to avoid DMA entirely!?!
+
 
 ## Log
+
+### Jan 18 - handling the end.
+
+how can the device know when it's at the end of the chain and need to loop back?
+
+
+### Jan 17 - wire protocol
+
+I keep bouncing between:
+
+- fixed size, deterministic protocol that can be (tediously) implemented by hand
+- leaning on rust/postcard and "hacking" streaming by repeatedly trying to deserialize, e.g., message header.
+
+the former seems, well, tedious and hard to debug when I inevitably get things wrong.
+the latter feels like it'd make streaming potentially clunky/slow and make it harder for others to interop.
+
+In particular, the latency would seem to be nondeterministic if CPU spends a lot of time trying to deserialize a header.
+
+Alternatively I could "waste" some time to reduce jitter, and not try to deserialize until maxsize bytes have arrived (or end-of-packet).
+
+I think I should do my own streaming for now, since at least I'll learn some stuff and have a point of comparison later.
+
+One other question is how to handle CRC errors --- with ethercat the ethernet hardware handles this.
+But in my case, since the CRC comes at the end, how do I actually act on it?
+I guess I have to "buffer" the command and only "run" it once CRC checks out.
+
+that doesn't help with messages that I'm already streaming along, but it will at least eliminate problems with side effects like setting device outputs.
+
+
 ### Jan 17 - continued uart echoing
 
 Guess it's time to learn about futures and esp32 interrupts more myself.
@@ -39,9 +70,6 @@ Here's the plan for implementing echo:
 - set fifo empty/full sizes to be half the buffer sizes
 - rx task uses embedded io read
 - tx task reads up to tx fifo length from bbqueue, writes it and awaits fifo half empty interrupt to do it again --- ohh, I can use embedded async write_all for this too.
-
-
-
 
 ### Jan 16 - run into embassy esp32 uart gaps
 

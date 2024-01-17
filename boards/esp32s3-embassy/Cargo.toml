@@ -26,6 +26,7 @@ embassy-sync       = "0.5.0"
 
 static_cell = { version = "2.0.0", features = ["nightly"] }
 bbqueue = "0.5.1"
+crc = "3.0.1"
 
 [features]
 #embassy-integrated-timers

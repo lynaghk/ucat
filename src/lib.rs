@@ -3,41 +3,38 @@
 pub const MAX_FRAME_SIZE: usize = 2048;
 
 pub use heapless::String;
+pub use num_enum::TryFromPrimitive;
 
-#[derive(Debug)]
-pub struct GroupAddress(u8);
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
-pub struct DeviceAddress(i16);
+/// devices increment address for some message types
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Address(pub i16);
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub name: String<64>,
 }
 
-#[derive(Debug)]
-pub enum Message {
-    Enumerate,
-    Query(DeviceAddress),
-    QueryResponse(DeviceInfo),
-    Initialize(DeviceAddress, GroupAddress),
-    ProcessUpdate(GroupAddress),
+#[derive(Debug, Serialize, Deserialize, num_enum::TryFromPrimitive)]
+#[repr(u8)]
+pub enum MessageType {
+    // device increments working counter
+    Enumerate, // address ignored, payload: empty
+
+    // device increments address, then acts if address is 0.
+    Initialize, // device address, read payload: group address
+    Identify,   // device address, write payload: DeviceInfo
+    Query,      // device address, read/write payload: (device-specific types)
+
+    // device acts if assigned to this group address
+    ProcessUpdate, // group address, read/write payload: PDI
 }
 
-#[derive(Debug)]
-pub struct Frame {
-    pub message: Message,
-    pub working_count: u16,
-    pub crc: u32,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Frame<'a> {
+    pub message_type: MessageType,
+    pub address: Address,
+    pub payload: &'a [u8],
+    pub crc: u32, //CRC of everything above
 }
-
-pub fn send() {}
-
-//heapless::Vec
-
-// pub fn count_devices() -> Result<u16> {
-//     Frame {
-//         command: Command::Enumerate,
-// data: Heapless
-//     }
-// }

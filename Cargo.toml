@@ -8,3 +8,5 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", features = ["experimental-derive"]  }
 heapless = { version = "*", features = ["serde"] }
 num_enum = { version = "0.7", default-features = false }
+crc = "3"
+const-str = "0.5.6"

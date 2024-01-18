@@ -9,3 +9,7 @@ anyhow = "*"
 crc = "3.0.1"
 postcard = { version = "1.0.8", features = ["use-std"] }
 serialport = "4.3.0"
+log = "*"
+env_logger = "*"
+#embedded-io-async = { version = "0.6", features = ["std"] }
+

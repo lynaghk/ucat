@@ -2,10 +2,22 @@
 
 pub const MAX_FRAME_SIZE: usize = 2048;
 
+pub type Digest = crc::Digest<'static, u32>;
+pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
+
+pub use const_str::concat_bytes;
 pub use heapless::String;
 pub use num_enum::TryFromPrimitive;
 
 use serde::{Deserialize, Serialize};
+
+// #[derive(Debug, Serialize, Deserialize)]
+// pub struct Frame<'a> {
+//     pub message_type: MessageType,
+//     pub address: Address,
+//     pub payload: &'a [u8],
+//     pub crc: u32, //CRC of everything above
+// }
 
 /// devices increment address for some message types
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,8 +31,8 @@ pub struct DeviceInfo {
 #[derive(Debug, Serialize, Deserialize, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum MessageType {
-    // device increments working counter
-    Enumerate, // address ignored, payload: empty
+    // device increments address, no action taken
+    Enumerate,
 
     // device increments address, then acts if address is 0.
     Initialize, // device address, read payload: group address
@@ -30,24 +42,23 @@ pub enum MessageType {
     // device acts if assigned to this group address
     ProcessUpdate, // group address, read/write payload: PDI
 }
+use MessageType::*;
 
+// devices send this upstream when they boot
 // TODO: put version number as "address" in here?
 // TODO: generate this at compile time so it's always synced up with frame definition
-pub const INIT_FRAME: [u8; 8] = [
-    MessageType::Enumerate as u8,
-    0, // address
+const INIT_FRAME_BASE: &[u8] = &[
+    Enumerate as u8,
+    /////////////////////
+    0, // i16 address
     0,
-    0, // no payload
-    1, // uh, "CRC"
-    2,
-    3,
-    4,
+    /////////////////////
+    0, // u16 payload length = 0
+    0,
+    /////////////////////
+    // (no payload)
+    //
 ];
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Frame<'a> {
-    pub message_type: MessageType,
-    pub address: Address,
-    pub payload: &'a [u8],
-    pub crc: u32, //CRC of everything above
-}
+pub const INIT_FRAME: &[u8] =
+    concat_bytes!(INIT_FRAME_BASE, CRC.checksum(INIT_FRAME_BASE).to_le_bytes());

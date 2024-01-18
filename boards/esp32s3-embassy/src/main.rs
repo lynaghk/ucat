@@ -84,7 +84,27 @@ async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: Que
     // TODO: actual group address
     let group_address = 1;
 
-    loop {
+    'parser: loop {
+        let mut digest = CRC.digest();
+
+        // Ahh, rust, where the types are so complicated you resort to abstraction via syntax macros.
+        macro_rules! commit {
+            ($grant:expr, $buf: expr) => {
+                let n = $buf.len();
+                digest.update($buf);
+                $grant.commit(n);
+                output.data_available.signal(());
+            };
+
+            (digest) => {
+                let mut g = output.bbq.grant_exact(4).unwrap();
+                g.buf().copy_from_slice(&digest.finalize().to_le_bytes());
+                g.commit(4);
+                output.data_available.signal(());
+                digest = CRC.digest();
+            };
+        }
+
         let mut g = output.bbq.grant_exact(3).unwrap();
         let mut buf = g.buf();
 
@@ -96,7 +116,7 @@ async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: Que
         match MessageType::try_from(buf[0]) {
             Err(e) => {
                 error!("Bad message type: {}", e);
-                continue;
+                continue 'parser;
             }
 
             Ok(t) => {
@@ -104,20 +124,51 @@ async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: Que
                 let mut address = i16::from_le_bytes([buf[1], buf[2]]);
 
                 // increment address for device-oriented messages
-                if matches!(t, Initialize | Identify | Query) {
+                if matches!(t, Enumerate | Initialize | Identify | Query) {
                     address += 1;
-                    buf[1..2].copy_from_slice(&address.to_le_bytes())
+                    buf[1..3].copy_from_slice(&address.to_le_bytes())
                 }
 
-                g.commit(3);
+                commit!(g, buf);
 
-                // match (t, address) {
-                //     (Enumerate, _) => todo!(),
-                //     (Initialize, 0) => todo!(),
-                //     (Identify, 0) => todo!(),
-                //     (Query, 0) => todo!(),
-                //     (ProcessUpdate, addr) if addr == group_address => todo!(),
-                // }
+                match (t, address) {
+                    (Enumerate, _) => {
+                        // no work for us to do aside from forwarding the rest of the message
+
+                        let mut g = output.bbq.grant_exact(2).unwrap();
+                        let mut buf = g.buf();
+                        if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, &mut buf).await
+                        {
+                            error!("Upstream RX Error: {:?}", e);
+                            continue 'parser;
+                        }
+                        commit!(g, buf);
+
+                        // Read CRC
+                        let mut buf = [0u8; 4];
+                        if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, &mut buf).await
+                        {
+                            error!("Upstream RX Error: {:?}", e);
+                            continue 'parser;
+                        }
+                        info!("{:?}", buf);
+                        let actual = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        let expected = digest.clone().finalize();
+                        if actual != expected {
+                            error!("Bad message CRC, expected {expected} got {actual}");
+                        }
+
+                        // well, too late to do anything about it now. send out the one we expected.
+                        commit!(digest);
+
+                        info!("enumerated");
+                    }
+                    (Initialize, 0) => todo!(),
+                    (Identify, 0) => todo!(),
+                    (Query, 0) => todo!(),
+                    (ProcessUpdate, addr) if addr == group_address => todo!(),
+                    _ => todo!(),
+                }
             }
         }
     }

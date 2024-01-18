@@ -30,6 +30,10 @@ https://github.com/udoprog/bittle for bitsets?
 
 esp32s3 has UART_LOOPBACK in hardware --- could use this to avoid DMA entirely!?!
 
+parsing options:
+  https://github.com/sharksforarms/deku
+  https://docs.rs/binrw/latest/binrw/ - maybe faster than serde? keep retrying on stream.
+
 
 ## Log
 

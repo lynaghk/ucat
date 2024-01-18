@@ -4,17 +4,16 @@
 #![allow(non_camel_case_types)]
 
 use bbqueue::{BBBuffer, Consumer, Producer};
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel, signal::Signal};
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
-use esp32s3_hal::{
-    clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, Delay, Rmt, IO,
-};
+use esp32s3_hal::{clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, Rmt, IO};
 use esp_backtrace as _;
 use esp_hal_common::{
     gpio::{GpioPin, Unknown},
     peripherals::{UART1, UART2},
     Uart, UartRx, UartTx,
 };
+use futures::future::FutureExt;
 use log::*;
 use static_cell::make_static;
 
@@ -72,17 +71,21 @@ static DOWNSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
 type UPSTREAM_UART = UART1;
 type DOWNSTREAM_UART = UART2;
 
-#[embassy_executor::task]
-async fn upstream_reader(
-    mut rx: UartRx<'static, UPSTREAM_UART>,
-    mut downstream: Producer<'static, BUFFER_SIZE>,
+struct Queue<T> {
+    bbq: T,
     data_available: &'static Signal<NoopRawMutex, ()>,
-) {
-    loop {
-        // TODO: actual group address
-        let group_address = 1;
+}
 
-        let mut g = downstream.grant_exact(3).unwrap();
+type QueueProducer = Queue<Producer<'static, BUFFER_SIZE>>;
+type QueueConsumer = Queue<Consumer<'static, BUFFER_SIZE>>;
+
+#[embassy_executor::task]
+async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: QueueProducer) {
+    // TODO: actual group address
+    let group_address = 1;
+
+    loop {
+        let mut g = output.bbq.grant_exact(3).unwrap();
         let mut buf = g.buf();
 
         if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, &mut buf).await {
@@ -98,7 +101,7 @@ async fn upstream_reader(
 
             Ok(t) => {
                 use MessageType::*;
-                let address = i16::from_le_bytes([buf[1], buf[2]]);
+                let mut address = i16::from_le_bytes([buf[1], buf[2]]);
 
                 // increment address for device-oriented messages
                 if matches!(t, Initialize | Identify | Query) {
@@ -106,22 +109,33 @@ async fn upstream_reader(
                     buf[1..2].copy_from_slice(&address.to_le_bytes())
                 }
 
-                match (t, address) {
-                    (Enumerate, _) => todo!(),
-                    (Initialize, 0) => todo!(),
-                    (Identify, 0) => todo!(),
-                    (Query, 0) => todo!(),
-                    (ProcessUpdate, group_address) => todo!(),
-                }
-
                 g.commit(3);
+
+                // match (t, address) {
+                //     (Enumerate, _) => todo!(),
+                //     (Initialize, 0) => todo!(),
+                //     (Identify, 0) => todo!(),
+                //     (Query, 0) => todo!(),
+                //     (ProcessUpdate, addr) if addr == group_address => todo!(),
+                // }
             }
         }
+    }
+}
 
+#[embassy_executor::task]
+async fn downstream_writer(_tx: UartTx<'static, DOWNSTREAM_UART>, _downstream: QueueConsumer) {
+    todo!();
+}
+
+#[embassy_executor::task]
+async fn downstream_reader(mut rx: UartRx<'static, DOWNSTREAM_UART>, mut upstream: QueueProducer) {
+    loop {
+        let mut g = upstream.bbq.grant_exact(RX_INTERRUPT_THRESHOLD).unwrap();
         match embedded_io_async::Read::read(&mut rx, &mut g.buf()).await {
             Ok(n) => {
                 g.commit(n);
-                data_available.signal(());
+                upstream.data_available.signal(());
             }
             Err(e) => error!("Downstream RX Error: {:?}", e),
         }
@@ -129,47 +143,16 @@ async fn upstream_reader(
 }
 
 #[embassy_executor::task]
-async fn downstream_writer(
-    mut tx: UartTx<'static, DOWNSTREAM_UART>,
-    mut downstream: Consumer<'static, BUFFER_SIZE>,
-    data_available: &'static Signal<NoopRawMutex, ()>,
-) {
-    loop {}
-}
-
-#[embassy_executor::task]
-async fn downstream_reader(
-    mut rx: UartRx<'static, DOWNSTREAM_UART>,
-    mut upstream: Producer<'static, BUFFER_SIZE>,
-    data_available: &'static Signal<NoopRawMutex, ()>,
-) {
+async fn upstream_writer(mut tx: UartTx<'static, UPSTREAM_UART>, mut upstream: QueueConsumer) {
     loop {
-        let mut g = upstream.grant_exact(RX_INTERRUPT_THRESHOLD).unwrap();
-        match embedded_io_async::Read::read(&mut rx, &mut g.buf()).await {
-            Ok(n) => {
-                g.commit(n);
-                data_available.signal(());
-            }
-            Err(e) => error!("Downstream RX Error: {:?}", e),
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn upstream_writer(
-    mut tx: UartTx<'static, UPSTREAM_UART>,
-    mut upstream: Consumer<'static, BUFFER_SIZE>,
-    data_available: &'static Signal<NoopRawMutex, ()>,
-) {
-    loop {
-        if let Ok(g) = upstream.read() {
+        if let Ok(g) = upstream.bbq.read() {
             match embedded_io_async::Write::write(&mut tx, &g.buf()).await {
                 Ok(n) => g.release(n),
                 Err(e) => error!("TX Error: {:?}", e),
             }
         } else {
-            data_available.wait().await;
-            data_available.reset();
+            upstream.data_available.wait().await;
+            upstream.data_available.reset();
         }
     }
 }
@@ -207,11 +190,110 @@ async fn main(spawner: embassy_executor::Spawner) {
     let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
 
-    //let mut delay = Delay::new(&clocks);
-    //delay.delay_ms(20u8);
-
     let timer_group0 = esp32s3_hal::timer::TimerGroup::new(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0.timer0);
+
+    let boot_delay = Timer::after(Duration::from_millis(40));
+
+    // UART
+
+    let (upstream_uart, downstream_uart) = {
+        use esp_hal_common::uart::{config::*, TxRxPins};
+        let config = Config {
+            baudrate: 115200,
+            data_bits: DataBits::DataBits8,
+            parity: Parity::ParityNone,
+            stop_bits: StopBits::STOP1,
+        };
+
+        let mut us = Uart::new_with_config(
+            peripherals.UART1,
+            config,
+            Some(TxRxPins::new_tx_rx(
+                io.pins.gpio17.into_push_pull_output(),
+                io.pins.gpio18.into_floating_input(),
+            )),
+            &clocks,
+        );
+
+        let mut ds = Uart::new_with_config(
+            peripherals.UART2,
+            config,
+            Some(TxRxPins::new_tx_rx(
+                io.pins.gpio19.into_push_pull_output(),
+                io.pins.gpio20.into_floating_input(),
+            )),
+            &clocks,
+        );
+
+        // Need this to trigger interrupt after 1 idle byte to unblock any read futures.
+        us.set_rx_timeout(Some(1)).unwrap();
+        ds.set_rx_timeout(Some(1)).unwrap();
+
+        us.set_rx_fifo_full_threshold(RX_INTERRUPT_THRESHOLD as u16)
+            .unwrap();
+        ds.set_rx_fifo_full_threshold(RX_INTERRUPT_THRESHOLD as u16)
+            .unwrap();
+
+        // TODO: esp-hal doesn't seem to have method to set this UART_TXFIFO_EMPTY_THRHD
+        // uart1
+        //     .set_tx_fifo_empty_threshold(TX_INTERRUPT_THRESHOLD as u16)
+        //     .unwrap();
+
+        (us, ds)
+    };
+
+    let make_queue = |bbq: &'static BBBuffer<BUFFER_SIZE>, sig| {
+        let (producer, consumer) = bbq.try_split().unwrap();
+        (
+            QueueProducer {
+                bbq: producer,
+                data_available: sig,
+            },
+            QueueConsumer {
+                bbq: consumer,
+                data_available: sig,
+            },
+        )
+    };
+
+    let (mut utx, urx) = upstream_uart.split();
+    let (dtx, mut drx) = downstream_uart.split();
+
+    let (up, uc) = make_queue(&UPSTREAM, &*make_static!(Signal::new()));
+    let (dp, dc) = make_queue(&DOWNSTREAM, &*make_static!(Signal::new()));
+
+    ///////////////////////////////////////
+    // Detect if device is at end of chain
+
+    // give upstream neighbor time to boot up, then send it init message
+    Timer::after(Duration::from_millis(20)).await;
+    embedded_io_async::Write::write(&mut utx, &INIT_FRAME)
+        .await
+        .unwrap();
+
+    // wait as long as possible for our downstream neighbor's message
+    boot_delay.await;
+
+    let device_at_end = {
+        let mut buf = [0; INIT_FRAME.len()];
+        match embedded_io_async::Read::read_exact(&mut drx, &mut buf).now_or_never() {
+            Some(Ok(())) if buf == INIT_FRAME => false,
+            _ => true,
+        }
+    };
+
+    info!("Device at end: {device_at_end}");
+
+    if device_at_end {
+        spawner.spawn(upstream_reader(urx, up)).ok();
+        spawner.spawn(upstream_writer(utx, uc)).ok();
+    } else {
+        spawner.spawn(upstream_reader(urx, dp)).ok();
+        spawner.spawn(downstream_writer(dtx, dc)).ok();
+        spawner.spawn(downstream_reader(drx, up)).ok();
+        spawner.spawn(upstream_writer(utx, uc)).ok();
+    }
 
     // Blinky LED
     {
@@ -219,67 +301,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         spawner.spawn(led(rmt, io.pins.gpio38)).ok();
     }
 
-    // UART
-    {
-        let (upstream_uart, downstream_uart) = {
-            use esp_hal_common::uart::{config::*, TxRxPins};
-            let config = Config {
-                baudrate: 115200,
-                data_bits: DataBits::DataBits8,
-                parity: Parity::ParityNone,
-                stop_bits: StopBits::STOP1,
-            };
-
-            let mut us = Uart::new_with_config(
-                peripherals.UART1,
-                config,
-                Some(TxRxPins::new_tx_rx(
-                    io.pins.gpio17.into_push_pull_output(),
-                    io.pins.gpio18.into_floating_input(),
-                )),
-                &clocks,
-            );
-
-            let mut ds = Uart::new_with_config(
-                peripherals.UART2,
-                config,
-                Some(TxRxPins::new_tx_rx(
-                    io.pins.gpio19.into_push_pull_output(),
-                    io.pins.gpio20.into_floating_input(),
-                )),
-                &clocks,
-            );
-
-            // Need this to trigger interrupt after 1 idle byte to unblock any read futures.
-            us.set_rx_timeout(Some(1)).unwrap();
-            ds.set_rx_timeout(Some(1)).unwrap();
-
-            us.set_rx_fifo_full_threshold(RX_INTERRUPT_THRESHOLD as u16)
-                .unwrap();
-            ds.set_rx_fifo_full_threshold(RX_INTERRUPT_THRESHOLD as u16)
-                .unwrap();
-
-            // TODO: esp-hal doesn't seem to have method to set this UART_TXFIFO_EMPTY_THRHD
-            // uart1
-            //     .set_tx_fifo_empty_threshold(TX_INTERRUPT_THRESHOLD as u16)
-            //     .unwrap();
-
-            (us, ds)
-        };
-
-        let (up, uc) = UPSTREAM.try_split().unwrap();
-        let (dp, dc) = DOWNSTREAM.try_split().unwrap();
-        let (utx, urx) = upstream_uart.split();
-        let (dtx, drx) = downstream_uart.split();
-        let urts = &*make_static!(Signal::new());
-        let drts = &*make_static!(Signal::new());
-
-        spawner.spawn(downstream_reader(drx, up, &urts)).ok();
-        spawner.spawn(upstream_writer(utx, uc, &urts)).ok();
-
-        spawner.spawn(upstream_reader(urx, dp, &drts)).ok();
-        spawner.spawn(downstream_writer(dtx, dc, &drts)).ok();
-    }
+    info!("Initialized");
 
     // let upstream = &*make_static!(Channel::new());
     // let downstream = &*make_static!(Channel::new());

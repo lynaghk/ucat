@@ -31,6 +31,19 @@ pub enum MessageType {
     ProcessUpdate, // group address, read/write payload: PDI
 }
 
+// TODO: put version number as "address" in here?
+// TODO: generate this at compile time so it's always synced up with frame definition
+pub const INIT_FRAME: [u8; 8] = [
+    MessageType::Enumerate as u8,
+    0, // address
+    0,
+    0, // no payload
+    1, // uh, "CRC"
+    2,
+    3,
+    4,
+];
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Frame<'a> {
     pub message_type: MessageType,

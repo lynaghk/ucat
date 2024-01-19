@@ -6,6 +6,13 @@ pub fn main() -> anyhow::Result<()> {
     let mut port = serialport::new("/dev/tty.usbserial-AQ0445MZ", 115_200).open()?;
     port.set_timeout(std::time::Duration::from_millis(10000))?;
 
+    let mut buf = [0u8; MAX_FRAME_SIZE];
+    info!("{:?}", &INIT_FRAME);
+    info!(
+        "{:?}",
+        create_frame(&mut buf, MessageType::Init, Address(0), &[])
+    );
+
     // wait for init frame from device
     {
         let needle = INIT_FRAME;

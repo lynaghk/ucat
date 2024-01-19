@@ -61,3 +61,32 @@ const INIT_FRAME_BASE: &[u8] = &[
 
 pub const INIT_FRAME: &[u8] =
     concat_bytes!(INIT_FRAME_BASE, CRC.checksum(INIT_FRAME_BASE).to_le_bytes());
+
+// TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs
+// chatgpt gave it a go, but requires dangerous nightly #![feature(generic_const_exprs)] https://chat.openai.com/share/f51804d9-3424-4690-900c-c00b73ccbf5e
+pub fn create_frame<'a>(
+    buf: &'a mut [u8],
+    t: MessageType,
+    address: Address,
+    payload: &[u8],
+) -> &'a [u8] {
+    let mut n = 0;
+
+    // TODO: is this macro usage horrible or fine? Not obvious if generated code is better or worse than a closure, and the latter has issues with letting CRC read buf.
+    macro_rules! write {
+        ($bs: expr) => {
+            let bs = $bs;
+            buf[n..(n + bs.len())].copy_from_slice(bs);
+            n += bs.len();
+        };
+    }
+
+    write!(&[t as u8]);
+    write!(&address.0.to_le_bytes());
+    write!(&(payload.len() as u16).to_le_bytes());
+
+    let crc = CRC.checksum(&buf[0..n]);
+    write!(&crc.to_le_bytes());
+
+    &buf[0..n]
+}

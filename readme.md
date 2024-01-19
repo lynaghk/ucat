@@ -37,6 +37,31 @@ parsing options:
 
 ## Log
 
+### Jan 19 - embassy size
+wondered if embassy would even fit on smaller stm32g0.
+as of 871d82de their blinky example is 
+
+but removing defmt and adding to cargo.toml
+
+[profile.release]
+debug = false
+lto = true
+opt-level = "s"
+incremental = false
+codegen-units = 1
+
+and to config.toml
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["panic_immediate_abort"]
+
+cargo bloat reports 3.3kB, which seems sufficiently small to me.
+
+Though the stmg4 hal blinky example (spin loop) is just 800 bytes.
+
+the usb_serial g0 example is 14.6KiB. cutting it close, but may be workable.
+
 ### Jan 18 - handling the end.
 
 how can the device know when it's at the end of the chain and need to loop back?

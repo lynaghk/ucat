@@ -19,6 +19,9 @@ use static_cell::make_static;
 
 use ucat::*;
 
+// TODO: derive this from postcard or something for this specific device.
+const PDI_WINDOW_SIZE: u16 = 1;
+
 // TODO: seems to be brutal to try and create generic tasks: https://github.com/embassy-rs/embassy/issues/1837
 // if I need to share RMT across tasks, may be best to just Peripherals::steal() ...
 #[embassy_executor::task]
@@ -65,6 +68,7 @@ const RX_INTERRUPT_THRESHOLD: usize = 4;
 //const TX_INTERRUPT_THRESHOLD: usize = 32;
 
 const BUFFER_SIZE: usize = ucat::MAX_FRAME_SIZE * 2;
+const CHUNK_SIZE: usize = 32;
 static UPSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
 static DOWNSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
 
@@ -81,45 +85,83 @@ type QueueConsumer = Queue<Consumer<'static, BUFFER_SIZE>>;
 
 #[embassy_executor::task]
 async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: QueueProducer) {
-    // TODO: actual group address
-    let group_address = 1;
+    let mut state = DeviceState::Reset;
 
     'parser: loop {
         let mut read_digest = CRC.digest();
         let mut write_digest = CRC.digest();
+        let mut sent_bytes = 0;
 
         // Ahh, rust, where the types are so complicated you resort to abstraction via syntax macros.
+        macro_rules! commit_without_digest {
+            ($grant:expr, $n: expr) => {
+                $grant.commit($n);
+                output.data_available.signal(());
+            };
+        }
+
         macro_rules! commit {
             ($grant:expr, $buf: expr) => {
                 let n = $buf.len();
                 write_digest.update($buf);
-                $grant.commit(n);
-                output.data_available.signal(());
+                commit_without_digest!($grant, n);
+                sent_bytes += n;
             };
         }
 
-        macro_rules! commit_digest {
-            () => {
-                let mut g = output.bbq.grant_exact(4).unwrap();
-                g.buf()
-                    .copy_from_slice(&write_digest.finalize().to_le_bytes());
-                g.commit(4);
-                output.data_available.signal(());
-            };
+        macro_rules! write {
+            ($bs: expr) => {{
+                let bs = $bs;
+                let mut g = output.bbq.grant_exact(bs.len()).unwrap();
+                let buf = g.buf();
+                buf[..].copy_from_slice(bs);
+                commit!(g, buf);
+            }};
         }
 
-        macro_rules! read_exact {
+        macro_rules! read_exact_without_digest {
             ($buf: expr) => {
-                read_exact!($buf, nodigest);
-                read_digest.update($buf);
-            };
-
-            ($buf: expr, nodigest) => {
                 if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, $buf).await {
                     error!("Upstream RX Error: {:?}", e);
                     continue 'parser;
                 }
             };
+        }
+
+        macro_rules! read_exact {
+            ($buf: expr) => {
+                read_exact_without_digest!($buf);
+                read_digest.update($buf);
+            };
+        }
+
+        macro_rules! read {
+            ($buf: expr) => {
+                match embedded_io_async::Read::read(&mut rx, $buf).await {
+                    Err(e) => {
+                        error!("Upstream RX Error: {:?}", e);
+                        continue 'parser;
+                    }
+                    Ok(n) => n,
+                }
+            };
+        }
+
+        macro_rules! forward {
+            ($n: expr) => {{
+                let mut remaining = $n;
+
+                while remaining > 0 {
+                    let mut g = output
+                        .bbq
+                        .grant_exact(core::cmp::min(CHUNK_SIZE, remaining))
+                        .unwrap();
+                    let buf = g.buf();
+                    let n = read!(buf);
+                    remaining -= n;
+                    commit!(g, &buf[0..n]);
+                }
+            }};
         }
 
         let mut g = output.bbq.grant_exact(3).unwrap();
@@ -130,11 +172,16 @@ async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: Que
         match MessageType::try_from(buf[0]) {
             Err(e) => {
                 error!("Bad message type: {}", e);
+                // TODO: should I abort here or just fall through assuming address and payload follow, then let rest of message get forwarded?
                 continue 'parser;
             }
 
             Ok(t) => {
                 use MessageType::*;
+
+                ///////////////////////////////
+                // read and send address
+
                 let mut address = i16::from_le_bytes([buf[1], buf[2]]);
 
                 // increment address for device-oriented messages
@@ -145,35 +192,115 @@ async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: Que
 
                 commit!(g, buf);
 
-                match (t, address) {
-                    (Enumerate, _) => {
-                        // no work for us to do aside from forwarding the rest of the message
+                ///////////////////////////////
+                // read and send payload length
 
-                        let mut g = output.bbq.grant_exact(2).unwrap();
-                        let buf = g.buf();
-                        read_exact!(buf);
-                        commit!(g, buf);
+                let mut g = output.bbq.grant_exact(2).unwrap();
+                let buf = g.buf();
+                read_exact!(buf);
+                let payload_length = u16::from_le_bytes([buf[0], buf[1]]);
+                commit!(g, buf);
 
-                        // Read CRC
-                        let mut buf = [0u8; 4];
-                        read_exact!(&mut buf, nodigest);
-                        let actual = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        let expected = read_digest.clone().finalize();
-                        if actual != expected {
-                            error!("Bad message CRC, expected {expected} got {actual}");
-                        }
+                ///////////////////////////////
+                // message-specific handling
 
-                        // well, too late to do anything about it now. send out the one we expected.
-                        commit_digest!();
-
+                match (t, address, &state) {
+                    (Enumerate, _, _) => {
                         info!("enumerated");
                     }
-                    (Initialize, 0) => todo!(),
-                    (Identify, 0) => todo!(),
-                    (Query, 0) => todo!(),
-                    (ProcessUpdate, addr) if addr == group_address => todo!(),
-                    _ => todo!(),
+
+                    (Initialize, 0, _) => {
+                        // payload is group address and pdi offset
+                        let mut g = output.bbq.grant_exact(4).unwrap();
+                        let buf = g.buf();
+                        read_exact!(buf);
+                        let group_address = Address(i16::from_le_bytes([buf[0], buf[1]]));
+                        let pdi_offset = PDIOffset(u16::from_le_bytes([buf[2], buf[3]]));
+                        commit!(g, buf);
+
+                        // TODO: don't do this until CRC succeeds
+                        state = DeviceState::Initialized {
+                            group_address,
+                            pdi_offset,
+                        };
+                        info!("initialized: {state:?}");
+                    }
+
+                    (Identify, 0, _) => todo!(),
+
+                    (Query, 0, _) => todo!(),
+
+                    (
+                        ProcessUpdate,
+                        group_address,
+                        DeviceState::Initialized {
+                            group_address: Address(address),
+                            pdi_offset,
+                        },
+                    ) if group_address == *address => {
+                        if payload_length < ((pdi_offset.0 as u16) + PDI_WINDOW_SIZE) {
+                            error!("process update payload length smaller than pdi_offset + PDI_WINDOW_SIZE");
+                            continue 'parser;
+                        }
+                        forward!(pdi_offset.0 as usize);
+
+                        // TODO get latest payload for real
+                        let pdi_write = [55u8; PDI_WINDOW_SIZE as usize];
+                        write!(&pdi_write);
+
+                        let mut pdi_read = [0u8; PDI_WINDOW_SIZE as usize];
+                        read_exact!(&mut pdi_read[..]);
+
+                        info!("process update read: {pdi_read:?}");
+                    }
+
+                    (Initialize | Identify | Query | ProcessUpdate, _, _) => {
+                        // message for another device, nothing for us to do
+                    }
+                    (Init, _, _) => {
+                        error!("Device recieved Init message from Controller");
+                        continue 'parser;
+                    }
+                };
+
+                ///////////////////////////////
+                // forward remainder of frame
+                {
+                    let remaining =
+                        (payload_length as usize) - (sent_bytes - PRE_PAYLOAD_BYTE_COUNT);
+
+                    forward!(remaining)
                 }
+
+                ///////////////////////////
+                // check and send CRC
+                let crc_ok = {
+                    let mut buf = [0u8; CRC_BYTE_COUNT];
+                    read_exact_without_digest!(&mut buf);
+                    let actual = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let expected = read_digest.finalize();
+                    let crc_ok = actual == expected;
+                    if !crc_ok {
+                        error!("Bad message CRC, expected {expected} got {actual}");
+                    }
+
+                    let mut g = output.bbq.grant_exact(CRC_BYTE_COUNT).unwrap();
+                    g.buf().copy_from_slice(&if crc_ok {
+                        // then we should send our new CRC
+                        write_digest.finalize().to_le_bytes()
+                    } else {
+                        // if CRC on original message was bad, we should preserve it so that downstream devices don't act on the bad message (which we've already forwarded)
+                        buf
+                    });
+
+                    crc_ok
+                };
+
+                if crc_ok {
+                    // TODO: actuate state changes?
+                }
+
+                debug!("forwarded {t:#?}");
             }
         }
     }
@@ -357,7 +484,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         spawner.spawn(led(rmt, io.pins.gpio38)).ok();
     }
 
-    info!("Initialized");
+    info!("Tasks spawned");
 
     // let upstream = &*make_static!(Channel::new());
     // let downstream = &*make_static!(Channel::new());

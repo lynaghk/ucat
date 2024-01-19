@@ -7,7 +7,6 @@ pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
 
 pub use const_str::concat_bytes;
 pub use heapless::String;
-pub use num_enum::TryFromPrimitive;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,23 +18,34 @@ use serde::{Deserialize, Serialize};
 //     pub crc: u32, //CRC of everything above
 // }
 
-/// devices increment address for some message types
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct Address(pub i16);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct PDIOffset(pub u16);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub name: String<64>,
 }
 
-#[derive(Debug, Serialize, Deserialize, num_enum::TryFromPrimitive)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeviceState {
+    Reset,
+    Initialized {
+        group_address: Address,
+        pdi_offset: PDIOffset,
+    },
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum MessageType {
     // device increments address, no action taken
     Enumerate,
 
     // device increments address, then acts if address is 0.
-    Initialize, // device address, read payload: group address
+    Initialize, // device address, read payload: group address, PDI offset
     Identify,   // device address, write payload: DeviceInfo
     Query,      // device address, read/write payload: (device-specific types)
 
@@ -59,10 +69,14 @@ const INIT_FRAME_BASE: &[u8] = &[
                 // (no payload)
 ];
 
+pub const PRE_PAYLOAD_BYTE_COUNT: usize = 1 + 2 + 2;
+pub const CRC_BYTE_COUNT: usize = 4;
+
 pub const INIT_FRAME: &[u8] =
     concat_bytes!(INIT_FRAME_BASE, CRC.checksum(INIT_FRAME_BASE).to_le_bytes());
 
-// TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs
+// TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs.
+// TODO: compare generated code here with a fn where I do all of the slice offset math myself.
 // chatgpt gave it a go, but requires dangerous nightly #![feature(generic_const_exprs)] https://chat.openai.com/share/f51804d9-3424-4690-900c-c00b73ccbf5e
 pub fn create_frame<'a>(
     buf: &'a mut [u8],
@@ -84,9 +98,27 @@ pub fn create_frame<'a>(
     write!(&[t as u8]);
     write!(&address.0.to_le_bytes());
     write!(&(payload.len() as u16).to_le_bytes());
+    write!(payload);
 
     let crc = CRC.checksum(&buf[0..n]);
     write!(&crc.to_le_bytes());
 
     &buf[0..n]
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn everything() {
+        let mut buf = [0u8; MAX_FRAME_SIZE];
+
+        assert_eq!(
+            INIT_FRAME,
+            create_frame(&mut buf, MessageType::Init, Address(0), &[])
+        );
+
+        assert_eq!(INIT_FRAME_BASE.len(), PRE_PAYLOAD_BYTE_COUNT);
+    }
 }

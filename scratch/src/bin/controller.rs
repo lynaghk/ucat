@@ -16,7 +16,6 @@ pub fn main() -> anyhow::Result<()> {
 
         loop {
             let n = port.read(&mut buf[offset..]).unwrap();
-            //debug!("{:?}", &buf[offset..offset + n]);
             offset += n;
 
             if buf[..offset].windows(N).any(|w| w == needle) {

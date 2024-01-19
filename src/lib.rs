@@ -41,6 +41,8 @@ pub enum MessageType {
 
     // device acts if assigned to this group address
     ProcessUpdate, // group address, read/write payload: PDI
+
+    Init, // only devices send this upstream once when they boot; used to determine if they are end of chain.
 }
 use MessageType::*;
 
@@ -48,16 +50,13 @@ use MessageType::*;
 // TODO: put version number as "address" in here?
 // TODO: generate this at compile time so it's always synced up with frame definition
 const INIT_FRAME_BASE: &[u8] = &[
-    Enumerate as u8,
-    /////////////////////
-    0, // i16 address
-    0,
-    /////////////////////
-    0, // u16 payload length = 0
-    0,
-    /////////////////////
-    // (no payload)
-    //
+    Init as u8, // Message Type
+    0,          /////////////////////
+    0,          // i16 address
+    0,          /////////////////////
+    0,          // u16 payload length = 0
+                /////////////////////
+                // (no payload)
 ];
 
 pub const INIT_FRAME: &[u8] =

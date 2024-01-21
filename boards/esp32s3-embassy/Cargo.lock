@@ -1267,9 +1267,12 @@ dependencies = [
 name = "ucat"
 version = "0.1.0"
 dependencies = [
+ "bbqueue",
  "const-str",
  "crc",
+ "embedded-io-async",
  "heapless 0.8.0",
+ "log",
  "num_enum 0.7.2",
  "postcard",
  "serde",

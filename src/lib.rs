@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 pub const MAX_FRAME_SIZE: usize = 2048;
 
@@ -7,6 +7,7 @@ pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
 
 pub use const_str::concat_bytes;
 pub use heapless::String;
+use log::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,18 +19,19 @@ use serde::{Deserialize, Serialize};
 //     pub crc: u32, //CRC of everything above
 // }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Address(pub i16);
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PDIOffset(pub u16);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeviceInfo {
     pub name: String<64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+//TODO: should this be copy?
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum DeviceState {
     Reset,
     Initialized {
@@ -78,7 +80,7 @@ pub const INIT_FRAME: &[u8] =
 // TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs.
 // TODO: compare generated code here with a fn where I do all of the slice offset math myself.
 // chatgpt gave it a go, but requires dangerous nightly #![feature(generic_const_exprs)] https://chat.openai.com/share/f51804d9-3424-4690-900c-c00b73ccbf5e
-pub fn create_frame<'a>(
+pub fn write_frame<'a>(
     buf: &'a mut [u8],
     t: MessageType,
     address: Address,
@@ -106,19 +108,311 @@ pub fn create_frame<'a>(
     &buf[0..n]
 }
 
+#[cfg(feature = "std")]
+fn frame(t: MessageType, address: Address, payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![0; MAX_FRAME_SIZE];
+    let len = write_frame(&mut v[..], t, address, payload).len();
+    v.truncate(len);
+    v
+}
+
+use bbqueue::Producer;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub enum Error {
+    TODO,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub enum Action {
+    NewState(DeviceState),
+}
+
+pub async fn try_parse_frame<R, const N: usize>(
+    state: DeviceState,
+    mut rx: R,
+    bbq: &mut Producer<'_, N>,
+    data_available: impl Fn(),
+) -> Result<Option<Action>, Error>
+where
+    R: embedded_io_async::Read,
+{
+    ////////////
+    // TODO: move this stuff to config object
+    const CHUNK_SIZE: usize = 32;
+    // TODO: derive this from postcard or something for this specific device.
+    const PDI_WINDOW_SIZE: u16 = 1;
+
+    let mut read_digest = CRC.digest();
+    let mut write_digest = CRC.digest();
+    let mut sent_bytes = 0;
+
+    // Ahh, rust, where the types are so complicated you resort to abstraction via syntax macros.
+    macro_rules! commit_without_digest {
+        ($grant:expr, $n: expr) => {
+            $grant.commit($n);
+            data_available();
+        };
+    }
+
+    macro_rules! commit {
+        ($grant:expr, $buf: expr) => {
+            let n = $buf.len();
+            write_digest.update($buf);
+            commit_without_digest!($grant, n);
+            sent_bytes += n;
+        };
+    }
+
+    macro_rules! write {
+        ($bs: expr) => {{
+            let bs = $bs;
+            let mut g = bbq.grant_exact(bs.len()).unwrap();
+            let buf = g.buf();
+            buf[..].copy_from_slice(bs);
+            commit!(g, buf);
+        }};
+    }
+
+    macro_rules! read_exact_without_digest {
+        ($buf: expr) => {
+            if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, $buf).await {
+                error!("Upstream RX Error: {:?}", e);
+                return Err(Error::TODO);
+            }
+        };
+    }
+
+    macro_rules! read_exact {
+        ($buf: expr) => {
+            read_exact_without_digest!($buf);
+            read_digest.update($buf);
+        };
+    }
+
+    macro_rules! read {
+        ($buf: expr) => {
+            match embedded_io_async::Read::read(&mut rx, $buf).await {
+                Err(e) => {
+                    error!("Upstream RX Error: {:?}", e);
+                    return Err(Error::TODO);
+                }
+                Ok(n) => n,
+            }
+        };
+    }
+
+    macro_rules! forward {
+        ($n: expr) => {{
+            let mut remaining = $n;
+
+            while remaining > 0 {
+                let mut g = bbq
+                    .grant_exact(core::cmp::min(CHUNK_SIZE, remaining))
+                    .unwrap();
+                let buf = g.buf();
+                let n = read!(buf);
+                remaining -= n;
+                commit!(g, &buf[0..n]);
+            }
+        }};
+    }
+
+    let mut g = bbq.grant_exact(3).unwrap();
+    let buf = g.buf();
+    read_exact!(buf);
+
+    match MessageType::try_from(buf[0]) {
+        Err(e) => {
+            error!("Bad message type: {}", e);
+            // TODO: should I abort here or just fall through assuming address and payload follow, then let rest of message get forwarded?
+            Err(Error::TODO)
+        }
+
+        Ok(t) => {
+            use MessageType::*;
+
+            ///////////////////////////////
+            // read and send address
+
+            let mut address = i16::from_le_bytes([buf[1], buf[2]]);
+
+            // increment address for device-oriented messages
+            if matches!(t, Enumerate | Initialize | Identify | Query) {
+                address += 1;
+                buf[1..3].copy_from_slice(&address.to_le_bytes())
+            }
+
+            commit!(g, buf);
+
+            ///////////////////////////////
+            // read and send payload length
+
+            let mut g = bbq.grant_exact(2).unwrap();
+            let buf = g.buf();
+            read_exact!(buf);
+            let payload_length = u16::from_le_bytes([buf[0], buf[1]]);
+            commit!(g, buf);
+
+            ///////////////////////////////
+            // message-specific handling
+
+            let action = match (t, address, &state) {
+                (Enumerate, _, _) => {
+                    info!("enumerated");
+                    None
+                }
+
+                (Initialize, 0, _) => {
+                    // payload is group address and pdi offset
+                    let mut g = bbq.grant_exact(4).unwrap();
+                    let buf = g.buf();
+                    read_exact!(buf);
+                    let group_address = Address(i16::from_le_bytes([buf[0], buf[1]]));
+                    let pdi_offset = PDIOffset(u16::from_le_bytes([buf[2], buf[3]]));
+                    commit!(g, buf);
+                    let new_state = DeviceState::Initialized {
+                        group_address,
+                        pdi_offset,
+                    };
+                    info!("initialized: {new_state:?}");
+                    Some(Action::NewState(new_state))
+                }
+
+                (Identify, 0, _) => todo!(),
+
+                (Query, 0, _) => todo!(),
+
+                (
+                    ProcessUpdate,
+                    group_address,
+                    DeviceState::Initialized {
+                        group_address: Address(address),
+                        pdi_offset,
+                    },
+                ) if group_address == *address => {
+                    debug!("Handling ProcessUpdate");
+
+                    if payload_length < ((pdi_offset.0 as u16) + PDI_WINDOW_SIZE) {
+                        error!("process update payload length smaller than pdi_offset + PDI_WINDOW_SIZE");
+                        return Err(Error::TODO);
+                    }
+                    forward!(pdi_offset.0 as usize);
+
+                    // TODO get latest payload for real
+                    let pdi_write = [55u8; PDI_WINDOW_SIZE as usize];
+                    write!(&pdi_write);
+
+                    let mut pdi_read = [0u8; PDI_WINDOW_SIZE as usize];
+                    read_exact!(&mut pdi_read[..]);
+
+                    info!("process update read: {pdi_read:?}");
+
+                    // TODO: who owns PDI buffer?
+                    //Some(Action::PDIUpdate)
+
+                    None
+                }
+
+                (Initialize | Identify | Query | ProcessUpdate, _, _) => {
+                    // message for another device, nothing for us to do
+                    None
+                }
+                (Init, _, _) => {
+                    error!("Device recieved Init message from Controller");
+                    return Err(Error::TODO);
+                }
+            };
+
+            /////////////////////////////////////////
+            // forward remainder of frame up to CRC
+            {
+                let remaining = PRE_PAYLOAD_BYTE_COUNT + (payload_length as usize) - sent_bytes;
+                debug!("Forwarding {remaining} remaining bytes");
+                forward!(remaining)
+            }
+
+            ///////////////////////////
+            // check and send CRC
+            let crc_ok = {
+                let mut buf = [0u8; CRC_BYTE_COUNT];
+                read_exact_without_digest!(&mut buf);
+                let actual = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let expected = read_digest.finalize();
+                let crc_ok = actual == expected;
+                if !crc_ok {
+                    error!("Bad message CRC, expected {expected} got {actual}");
+                }
+
+                let mut g = bbq.grant_exact(CRC_BYTE_COUNT).unwrap();
+                g.buf().copy_from_slice(&if crc_ok {
+                    // then we should send our new CRC
+                    write_digest.finalize().to_le_bytes()
+                } else {
+                    // if CRC on original message was bad, we should preserve it so that downstream devices don't act on the bad message (which we've already forwarded)
+                    buf
+                });
+                commit_without_digest!(g, CRC_BYTE_COUNT);
+
+                crc_ok
+            };
+
+            if crc_ok {
+                Ok(action)
+            } else {
+                Err(Error::TODO)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
     #[test]
-    fn everything() {
+    fn misc() {
         let mut buf = [0u8; MAX_FRAME_SIZE];
 
         assert_eq!(
             INIT_FRAME,
-            create_frame(&mut buf, MessageType::Init, Address(0), &[])
+            write_frame(&mut buf, MessageType::Init, Address(0), &[])
         );
 
         assert_eq!(INIT_FRAME_BASE.len(), PRE_PAYLOAD_BYTE_COUNT);
+    }
+
+    fn test_parse(state: DeviceState, frame: &[u8]) -> (Result<Option<Action>, Error>, Vec<u8>) {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+            .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
+            .init();
+
+        smol::block_on(async move {
+            let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
+            let (mut producer, mut consumer) = bbq.try_split().unwrap();
+
+            let result = try_parse_frame(state, frame, &mut producer, || {}).await;
+
+            let mut downstream = vec![];
+            while let Ok(g) = consumer.read() {
+                let buf = g.buf();
+                let n = buf.len();
+                downstream.extend_from_slice(&buf);
+                g.release(n);
+            }
+
+            (result, downstream)
+        })
+    }
+
+    #[test]
+    fn integration() {
+        assert_eq!(
+            test_parse(
+                DeviceState::Reset,
+                &frame(MessageType::Enumerate, Address(0), &[])[..],
+            ),
+            (Ok(None), frame(MessageType::Enumerate, Address(1), &[]),)
+        );
     }
 }

@@ -3,7 +3,6 @@
 #![feature(type_alias_impl_trait)]
 #![allow(non_camel_case_types)]
 
-use bbqueue::{BBBuffer, Consumer, Producer};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
 use esp32s3_hal::{clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, Rmt, IO};
@@ -18,9 +17,6 @@ use log::*;
 use static_cell::make_static;
 
 use ucat::*;
-
-// TODO: derive this from postcard or something for this specific device.
-const PDI_WINDOW_SIZE: u16 = 1;
 
 // TODO: seems to be brutal to try and create generic tasks: https://github.com/embassy-rs/embassy/issues/1837
 // if I need to share RMT across tasks, may be best to just Peripherals::steal() ...
@@ -68,257 +64,51 @@ const RX_INTERRUPT_THRESHOLD: usize = 4;
 //const TX_INTERRUPT_THRESHOLD: usize = 32;
 
 const BUFFER_SIZE: usize = ucat::MAX_FRAME_SIZE * 2;
-const CHUNK_SIZE: usize = 32;
+
 static UPSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
 static DOWNSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
 
 type UPSTREAM_UART = UART1;
 type DOWNSTREAM_UART = UART2;
 
-struct Queue<T> {
-    bbq: T,
-    data_available: &'static Signal<NoopRawMutex, ()>,
-}
-
-type QueueProducer = Queue<Producer<'static, BUFFER_SIZE>>;
-type QueueConsumer = Queue<Consumer<'static, BUFFER_SIZE>>;
+type QueueProducer = Producer<'static, BUFFER_SIZE>;
+type QueueConsumer = Consumer<'static, BUFFER_SIZE>;
+type DataAvailableSignal = &'static Signal<NoopRawMutex, ()>;
 
 #[embassy_executor::task]
-async fn upstream_reader(mut rx: UartRx<'static, UPSTREAM_UART>, mut output: QueueProducer) {
-    let mut state = DeviceState::Reset;
-
-    'parser: loop {
-        let mut read_digest = CRC.digest();
-        let mut write_digest = CRC.digest();
-        let mut sent_bytes = 0;
-
-        // Ahh, rust, where the types are so complicated you resort to abstraction via syntax macros.
-        macro_rules! commit_without_digest {
-            ($grant:expr, $n: expr) => {
-                $grant.commit($n);
-                output.data_available.signal(());
-            };
-        }
-
-        macro_rules! commit {
-            ($grant:expr, $buf: expr) => {
-                let n = $buf.len();
-                write_digest.update($buf);
-                commit_without_digest!($grant, n);
-                sent_bytes += n;
-            };
-        }
-
-        macro_rules! write {
-            ($bs: expr) => {{
-                let bs = $bs;
-                let mut g = output.bbq.grant_exact(bs.len()).unwrap();
-                let buf = g.buf();
-                buf[..].copy_from_slice(bs);
-                commit!(g, buf);
-            }};
-        }
-
-        macro_rules! read_exact_without_digest {
-            ($buf: expr) => {
-                if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, $buf).await {
-                    error!("Upstream RX Error: {:?}", e);
-                    continue 'parser;
-                }
-            };
-        }
-
-        macro_rules! read_exact {
-            ($buf: expr) => {
-                read_exact_without_digest!($buf);
-                read_digest.update($buf);
-            };
-        }
-
-        macro_rules! read {
-            ($buf: expr) => {
-                match embedded_io_async::Read::read(&mut rx, $buf).await {
-                    Err(e) => {
-                        error!("Upstream RX Error: {:?}", e);
-                        continue 'parser;
-                    }
-                    Ok(n) => n,
-                }
-            };
-        }
-
-        macro_rules! forward {
-            ($n: expr) => {{
-                let mut remaining = $n;
-
-                while remaining > 0 {
-                    let mut g = output
-                        .bbq
-                        .grant_exact(core::cmp::min(CHUNK_SIZE, remaining))
-                        .unwrap();
-                    let buf = g.buf();
-                    let n = read!(buf);
-                    remaining -= n;
-                    commit!(g, &buf[0..n]);
-                }
-            }};
-        }
-
-        let mut g = output.bbq.grant_exact(3).unwrap();
-        let buf = g.buf();
-
-        read_exact!(buf);
-
-        match MessageType::try_from(buf[0]) {
-            Err(e) => {
-                error!("Bad message type: {}", e);
-                // TODO: should I abort here or just fall through assuming address and payload follow, then let rest of message get forwarded?
-                continue 'parser;
-            }
-
-            Ok(t) => {
-                use MessageType::*;
-
-                ///////////////////////////////
-                // read and send address
-
-                let mut address = i16::from_le_bytes([buf[1], buf[2]]);
-
-                // increment address for device-oriented messages
-                if matches!(t, Enumerate | Initialize | Identify | Query) {
-                    address += 1;
-                    buf[1..3].copy_from_slice(&address.to_le_bytes())
-                }
-
-                commit!(g, buf);
-
-                ///////////////////////////////
-                // read and send payload length
-
-                let mut g = output.bbq.grant_exact(2).unwrap();
-                let buf = g.buf();
-                read_exact!(buf);
-                let payload_length = u16::from_le_bytes([buf[0], buf[1]]);
-                commit!(g, buf);
-
-                ///////////////////////////////
-                // message-specific handling
-
-                match (t, address, &state) {
-                    (Enumerate, _, _) => {
-                        info!("enumerated");
-                    }
-
-                    (Initialize, 0, _) => {
-                        // payload is group address and pdi offset
-                        let mut g = output.bbq.grant_exact(4).unwrap();
-                        let buf = g.buf();
-                        read_exact!(buf);
-                        let group_address = Address(i16::from_le_bytes([buf[0], buf[1]]));
-                        let pdi_offset = PDIOffset(u16::from_le_bytes([buf[2], buf[3]]));
-                        commit!(g, buf);
-
-                        // TODO: don't do this until CRC succeeds
-                        state = DeviceState::Initialized {
-                            group_address,
-                            pdi_offset,
-                        };
-                        info!("initialized: {state:?}");
-                    }
-
-                    (Identify, 0, _) => todo!(),
-
-                    (Query, 0, _) => todo!(),
-
-                    (
-                        ProcessUpdate,
-                        group_address,
-                        DeviceState::Initialized {
-                            group_address: Address(address),
-                            pdi_offset,
-                        },
-                    ) if group_address == *address => {
-                        if payload_length < ((pdi_offset.0 as u16) + PDI_WINDOW_SIZE) {
-                            error!("process update payload length smaller than pdi_offset + PDI_WINDOW_SIZE");
-                            continue 'parser;
-                        }
-                        forward!(pdi_offset.0 as usize);
-
-                        // TODO get latest payload for real
-                        let pdi_write = [55u8; PDI_WINDOW_SIZE as usize];
-                        write!(&pdi_write);
-
-                        let mut pdi_read = [0u8; PDI_WINDOW_SIZE as usize];
-                        read_exact!(&mut pdi_read[..]);
-
-                        info!("process update read: {pdi_read:?}");
-                    }
-
-                    (Initialize | Identify | Query | ProcessUpdate, _, _) => {
-                        // message for another device, nothing for us to do
-                    }
-                    (Init, _, _) => {
-                        error!("Device recieved Init message from Controller");
-                        continue 'parser;
-                    }
-                };
-
-                ///////////////////////////////
-                // forward remainder of frame
-                {
-                    let remaining =
-                        (payload_length as usize) - (sent_bytes - PRE_PAYLOAD_BYTE_COUNT);
-
-                    forward!(remaining)
-                }
-
-                ///////////////////////////
-                // check and send CRC
-                let crc_ok = {
-                    let mut buf = [0u8; CRC_BYTE_COUNT];
-                    read_exact_without_digest!(&mut buf);
-                    let actual = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                    let expected = read_digest.finalize();
-                    let crc_ok = actual == expected;
-                    if !crc_ok {
-                        error!("Bad message CRC, expected {expected} got {actual}");
-                    }
-
-                    let mut g = output.bbq.grant_exact(CRC_BYTE_COUNT).unwrap();
-                    g.buf().copy_from_slice(&if crc_ok {
-                        // then we should send our new CRC
-                        write_digest.finalize().to_le_bytes()
-                    } else {
-                        // if CRC on original message was bad, we should preserve it so that downstream devices don't act on the bad message (which we've already forwarded)
-                        buf
-                    });
-
-                    crc_ok
-                };
-
-                if crc_ok {
-                    // TODO: actuate state changes?
-                }
-
-                debug!("forwarded {t:#?}");
-            }
-        }
+async fn upstream_reader(
+    mut rx: UartRx<'static, UPSTREAM_UART>,
+    mut downstream: QueueProducer,
+    data_available: DataAvailableSignal,
+) {
+    let state = DeviceState::Reset;
+    let data_available = || data_available.signal(());
+    loop {
+        let _ = try_parse_frame(state.clone(), &mut rx, &mut downstream, data_available).await;
     }
 }
 
 #[embassy_executor::task]
-async fn downstream_writer(_tx: UartTx<'static, DOWNSTREAM_UART>, _downstream: QueueConsumer) {
+async fn downstream_writer(
+    _tx: UartTx<'static, DOWNSTREAM_UART>,
+    mut _consumer: QueueConsumer,
+    _data_available: DataAvailableSignal,
+) {
     todo!();
 }
 
 #[embassy_executor::task]
-async fn downstream_reader(mut rx: UartRx<'static, DOWNSTREAM_UART>, mut upstream: QueueProducer) {
+async fn downstream_reader(
+    mut rx: UartRx<'static, DOWNSTREAM_UART>,
+    mut upstream: QueueProducer,
+    data_available: DataAvailableSignal,
+) {
     loop {
-        let mut g = upstream.bbq.grant_exact(RX_INTERRUPT_THRESHOLD).unwrap();
+        let mut g = upstream.grant_exact(RX_INTERRUPT_THRESHOLD).unwrap();
         match embedded_io_async::Read::read(&mut rx, &mut g.buf()).await {
             Ok(n) => {
                 g.commit(n);
-                upstream.data_available.signal(());
+                data_available.signal(());
             }
             Err(e) => error!("Downstream RX Error: {:?}", e),
         }
@@ -326,16 +116,20 @@ async fn downstream_reader(mut rx: UartRx<'static, DOWNSTREAM_UART>, mut upstrea
 }
 
 #[embassy_executor::task]
-async fn upstream_writer(mut tx: UartTx<'static, UPSTREAM_UART>, mut upstream: QueueConsumer) {
+async fn upstream_writer(
+    mut tx: UartTx<'static, UPSTREAM_UART>,
+    mut upstream: QueueConsumer,
+    data_available: DataAvailableSignal,
+) {
     loop {
-        if let Ok(g) = upstream.bbq.read() {
+        if let Ok(g) = upstream.read() {
             match embedded_io_async::Write::write(&mut tx, &g.buf()).await {
                 Ok(n) => g.release(n),
                 Err(e) => error!("TX Error: {:?}", e),
             }
         } else {
-            upstream.data_available.wait().await;
-            upstream.data_available.reset();
+            data_available.wait().await;
+            data_available.reset();
         }
     }
 }
@@ -426,25 +220,13 @@ async fn main(spawner: embassy_executor::Spawner) {
         (us, ds)
     };
 
-    let make_queue = |bbq: &'static BBBuffer<BUFFER_SIZE>, sig| {
-        let (producer, consumer) = bbq.try_split().unwrap();
-        (
-            QueueProducer {
-                bbq: producer,
-                data_available: sig,
-            },
-            QueueConsumer {
-                bbq: consumer,
-                data_available: sig,
-            },
-        )
-    };
-
     let (mut utx, urx) = upstream_uart.split();
     let (dtx, mut drx) = downstream_uart.split();
 
-    let (up, uc) = make_queue(&UPSTREAM, &*make_static!(Signal::new()));
-    let (dp, dc) = make_queue(&DOWNSTREAM, &*make_static!(Signal::new()));
+    let uda = &*make_static!(Signal::new());
+    let dda = &*make_static!(Signal::new());
+    let (up, uc) = UPSTREAM.try_split().unwrap();
+    let (dp, dc) = DOWNSTREAM.try_split().unwrap();
 
     ///////////////////////////////////////
     // Detect if device is at end of chain
@@ -469,13 +251,13 @@ async fn main(spawner: embassy_executor::Spawner) {
     info!("Device at end: {device_at_end}");
 
     if device_at_end {
-        spawner.spawn(upstream_reader(urx, up)).ok();
-        spawner.spawn(upstream_writer(utx, uc)).ok();
+        spawner.spawn(upstream_reader(urx, up, uda)).ok();
+        spawner.spawn(upstream_writer(utx, uc, uda)).ok();
     } else {
-        spawner.spawn(upstream_reader(urx, dp)).ok();
-        spawner.spawn(downstream_writer(dtx, dc)).ok();
-        spawner.spawn(downstream_reader(drx, up)).ok();
-        spawner.spawn(upstream_writer(utx, uc)).ok();
+        spawner.spawn(upstream_reader(urx, dp, dda)).ok();
+        spawner.spawn(downstream_writer(dtx, dc, dda)).ok();
+        spawner.spawn(downstream_reader(drx, up, uda)).ok();
+        spawner.spawn(upstream_writer(utx, uc, uda)).ok();
     }
 
     // Blinky LED

@@ -1,32 +1,6 @@
 use log::*;
+use ucat::controller::*;
 use ucat::*;
-
-pub fn wait_for_init_frame(port: &mut Box<dyn serialport::SerialPort>) {
-    // wait for init frame from device
-    {
-        let needle = INIT_FRAME;
-        const N: usize = INIT_FRAME.len();
-
-        let mut buf = [0; 2 * N];
-        let mut offset = 0;
-
-        loop {
-            let n = port.read(&mut buf[offset..]).unwrap();
-            offset += n;
-
-            if buf[..offset].windows(N).any(|w| w == needle) {
-                // done!
-                break;
-            };
-
-            if offset == 2 * N {
-                // buffer is full and we still haven't found anything. Drop front half, as we know they can't be part of any match.
-                buf.copy_within(N..2 * N, 0);
-                offset = 0;
-            }
-        }
-    }
-}
 
 pub fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
@@ -51,10 +25,7 @@ pub fn main() -> anyhow::Result<()> {
         MessageType::Enumerate,
         Address(0),
         &[],
-    ))
-    .unwrap();
-
-    // TODO: wait for correct response
+    ))?;
 
     let group_address = Address(7);
     let pdi_length = 2;

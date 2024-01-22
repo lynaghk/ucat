@@ -1,4 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![feature(error_in_core)]
+
+pub mod controller;
 
 pub const MAX_FRAME_SIZE: usize = 2048;
 
@@ -8,7 +11,6 @@ pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
 pub use const_str::concat_bytes;
 pub use heapless::String;
 use log::*;
-
 use serde::{Deserialize, Serialize};
 
 // #[derive(Debug, Serialize, Deserialize)]
@@ -77,7 +79,7 @@ pub const CRC_BYTE_COUNT: usize = 4;
 pub const INIT_FRAME: &[u8] =
     concat_bytes!(INIT_FRAME_BASE, CRC.checksum(INIT_FRAME_BASE).to_le_bytes());
 
-// TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs.
+// TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs --- oh, someone made a crate https://github.com/Eolu/const-gen
 // TODO: compare generated code here with a fn where I do all of the slice offset math myself.
 // chatgpt gave it a go, but requires dangerous nightly #![feature(generic_const_exprs)] https://chat.openai.com/share/f51804d9-3424-4690-900c-c00b73ccbf5e
 pub fn write_frame<'a>(
@@ -109,7 +111,7 @@ pub fn write_frame<'a>(
 }
 
 #[cfg(feature = "std")]
-fn frame(t: MessageType, address: Address, payload: &[u8]) -> Vec<u8> {
+pub fn frame(t: MessageType, address: Address, payload: &[u8]) -> Vec<u8> {
     let mut v = vec![0; MAX_FRAME_SIZE];
     let len = write_frame(&mut v[..], t, address, payload).len();
     v.truncate(len);
@@ -383,9 +385,9 @@ mod test {
     }
 
     fn test_parse(state: DeviceState, frame: &[u8]) -> (Result<Option<Action>, Error>, Vec<u8>) {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-            .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
-            .init();
+        // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        //     .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
+        //     .init();
 
         smol::block_on(async move {
             let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
@@ -414,5 +416,112 @@ mod test {
             ),
             (Ok(None), frame(MessageType::Enumerate, Address(1), &[]),)
         );
+    }
+
+    use embedded_io_async::{Read, Write};
+    use smol::channel::{self, Receiver, Sender};
+
+    #[derive(Debug)]
+    struct MockError;
+
+    #[derive(Debug)]
+    struct MockSerial {
+        reader: Receiver<u8>,
+        writer: Sender<u8>,
+    }
+
+    impl embedded_io::Error for MockError {
+        fn kind(&self) -> embedded_io::ErrorKind {
+            embedded_io::ErrorKind::Other
+        }
+    }
+
+    impl embedded_io::ErrorType for MockSerial {
+        type Error = MockError;
+    }
+
+    impl Read for MockSerial {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            // Read data from the channel
+            for item in buf.iter_mut() {
+                *item = self.reader.recv().await.map_err(|_| MockError)?;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    impl Write for MockSerial {
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            // Write data to the channel
+            for &item in buf {
+                self.writer.send(item).await.map_err(|_| MockError)?;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    use smol::Task;
+
+    // Controller task
+    async fn controller(mut port: impl Read<Error = MockError> + Write<Error = MockError>) {
+        // Implementation for the controller
+    }
+
+    // Device task
+    async fn device(mut rx: impl Read<Error = MockError> + Write<Error = MockError>) {
+        let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
+        let (mut producer, mut consumer) = bbq.try_split().unwrap();
+
+        let mut state = DeviceState::Reset;
+        loop {
+            let result = try_parse_frame(state.clone(), &mut rx, &mut producer, || {}).await;
+
+            // TODO update state.
+        }
+    }
+
+    #[test]
+    fn test_controller_device_communication() {
+        smol::block_on(async {
+            // Create mock serial port streams
+            let (tx1, rx1) = channel::unbounded();
+            let (tx2, rx2) = channel::unbounded();
+
+            // Create mock serial ports
+            let controller_serial = MockSerial {
+                reader: rx2,
+                writer: tx1,
+            };
+            let device_serial = MockSerial {
+                reader: rx1,
+                writer: tx2,
+            };
+
+            // Start tasks
+            let controller_task = Task::spawn(controller(controller_serial));
+            let device_task = Task::spawn(device(device_serial));
+
+            // Here you can write code to test the communication
+
+            // let (_action, response) = test_parse(
+            //     DeviceState::Reset,
+            //     &frame(MessageType::Enumerate, Address(0), &[])[..],
+            // );
+
+            // wait_for(
+            //     &response[..],
+            //     &frame(MessageType::Enumerate, Address(1), &[]),
+            // )
+            // .await
+            // .unwrap()
+
+            // Await the completion of tasks
+            controller_task.await.expect("Controller task failed");
+            device_task.await.expect("Device task failed");
+        });
     }
 }

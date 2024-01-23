@@ -123,6 +123,9 @@ use bbqueue::Producer;
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum Error {
     TODO,
+    RX,
+    CRC,
+    BadMessageType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -180,7 +183,7 @@ where
         ($buf: expr) => {
             if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, $buf).await {
                 error!("Upstream RX Error: {:?}", e);
-                return Err(Error::TODO);
+                return Err(Error::RX);
             }
         };
     }
@@ -197,7 +200,7 @@ where
             match embedded_io_async::Read::read(&mut rx, $buf).await {
                 Err(e) => {
                     error!("Upstream RX Error: {:?}", e);
-                    return Err(Error::TODO);
+                    return Err(Error::RX);
                 }
                 Ok(n) => n,
             }
@@ -228,7 +231,7 @@ where
         Err(e) => {
             error!("Bad message type: {}", e);
             // TODO: should I abort here or just fall through assuming address and payload follow, then let rest of message get forwarded?
-            Err(Error::TODO)
+            Err(Error::BadMessageType)
         }
 
         Ok(t) => {
@@ -362,7 +365,7 @@ where
             if crc_ok {
                 Ok(action)
             } else {
-                Err(Error::TODO)
+                Err(Error::CRC)
             }
         }
     }
@@ -385,10 +388,6 @@ mod test {
     }
 
     fn test_parse(state: DeviceState, frame: &[u8]) -> (Result<Option<Action>, Error>, Vec<u8>) {
-        // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-        //     .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
-        //     .init();
-
         smol::block_on(async move {
             let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
             let (mut producer, mut consumer) = bbq.try_split().unwrap();
@@ -420,6 +419,7 @@ mod test {
 
     use embedded_io_async::{Read, Write};
     use smol::channel::{self, Receiver, Sender};
+    use smol::Executor;
 
     #[derive(Debug)]
     struct MockError;
@@ -464,34 +464,70 @@ mod test {
         }
     }
 
-    use smol::Task;
+    trait MockPort: Read<Error = MockError> + Write<Error = MockError> {}
+    impl MockPort for MockSerial {}
 
-    // Controller task
-    async fn controller(mut port: impl Read<Error = MockError> + Write<Error = MockError>) {
-        // Implementation for the controller
-    }
-
-    // Device task
-    async fn device(mut rx: impl Read<Error = MockError> + Write<Error = MockError>) {
+    async fn device(mut port: impl MockPort) {
         let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
         let (mut producer, mut consumer) = bbq.try_split().unwrap();
 
         let mut state = DeviceState::Reset;
         loop {
-            let result = try_parse_frame(state.clone(), &mut rx, &mut producer, || {}).await;
+            let result = try_parse_frame(state.clone(), &mut port, &mut producer, || {}).await;
 
-            // TODO update state.
+            while let Ok(g) = consumer.read() {
+                let buf = g.buf();
+                let n = buf.len();
+                port.write_all(&buf).await.unwrap();
+                g.release(n);
+            }
+
+            match result {
+                Ok(action) => {
+                    // TODO update state.
+                }
+                Err(Error::RX) => {
+                    return;
+                }
+
+                Err(e) => {
+                    error!("Unexpected device error: {e:?}");
+                    return;
+                }
+            }
         }
+    }
+
+    async fn controller(mut port: impl MockPort) {
+        port.write(&frame(MessageType::Enumerate, Address(0), &[])[..])
+            .await
+            .unwrap();
+
+        controller::wait_for(
+            &mut port,
+            &frame(MessageType::Enumerate, Address(1), &[])[..],
+        )
+        .await
+        .unwrap();
+
+        controller::wait_for(
+            &mut port,
+            &frame(MessageType::Initialize, Address(1), &[])[..],
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
     fn test_controller_device_communication() {
+        // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        //     .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
+        //     .init();
+
         smol::block_on(async {
-            // Create mock serial port streams
             let (tx1, rx1) = channel::unbounded();
             let (tx2, rx2) = channel::unbounded();
 
-            // Create mock serial ports
             let controller_serial = MockSerial {
                 reader: rx2,
                 writer: tx1,
@@ -501,27 +537,18 @@ mod test {
                 writer: tx2,
             };
 
-            // Start tasks
-            let controller_task = Task::spawn(controller(controller_serial));
-            let device_task = Task::spawn(device(device_serial));
-
-            // Here you can write code to test the communication
-
-            // let (_action, response) = test_parse(
-            //     DeviceState::Reset,
-            //     &frame(MessageType::Enumerate, Address(0), &[])[..],
-            // );
-
-            // wait_for(
-            //     &response[..],
-            //     &frame(MessageType::Enumerate, Address(1), &[]),
-            // )
-            // .await
-            // .unwrap()
+            let ex = Executor::new();
+            let _controller_task = ex.spawn(controller(controller_serial));
+            let _device_task = ex.spawn(device(device_serial));
 
             // Await the completion of tasks
-            controller_task.await.expect("Controller task failed");
-            device_task.await.expect("Device task failed");
+            for _ in 0..100 {
+                if ex.try_tick() == false {
+                    // no more tasks to run
+                    return;
+                }
+            }
+            panic!("Ran out of fuel");
         });
     }
 }

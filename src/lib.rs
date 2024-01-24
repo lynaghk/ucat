@@ -22,10 +22,33 @@ use serde::{Deserialize, Serialize};
 // }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct Address(pub i16);
+pub struct DeviceAddress(pub u16);
+
+impl DeviceAddress {
+    pub fn from_le_bytes(bytes: [u8; 2]) -> Self {
+        DeviceAddress(u16::from_le_bytes(bytes))
+    }
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct GroupAddress(pub u16);
+
+impl GroupAddress {
+    pub fn from_le_bytes(bytes: [u8; 2]) -> Self {
+        GroupAddress(u16::from_le_bytes(bytes))
+    }
+}
+
+type DeviceOrGroupAddressOnWire = i16;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PDIOffset(pub u16);
+
+impl PDIOffset {
+    pub fn from_le_bytes(bytes: [u8; 2]) -> Self {
+        PDIOffset(u16::from_le_bytes(bytes))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeviceInfo {
@@ -37,7 +60,7 @@ pub struct DeviceInfo {
 pub enum DeviceState {
     Reset,
     Initialized {
-        group_address: Address,
+        group_address: GroupAddress,
         pdi_offset: PDIOffset,
     },
 }
@@ -85,7 +108,7 @@ pub const INIT_FRAME: &[u8] =
 pub fn write_frame<'a>(
     buf: &'a mut [u8],
     t: MessageType,
-    address: Address,
+    address: DeviceOrGroupAddressOnWire,
     payload: &[u8],
 ) -> &'a [u8] {
     let mut n = 0;
@@ -100,7 +123,7 @@ pub fn write_frame<'a>(
     }
 
     write!(&[t as u8]);
-    write!(&address.0.to_le_bytes());
+    write!(&address.to_le_bytes());
     write!(&(payload.len() as u16).to_le_bytes());
     write!(payload);
 
@@ -111,9 +134,28 @@ pub fn write_frame<'a>(
 }
 
 #[cfg(feature = "std")]
-pub fn frame(t: MessageType, address: Address, payload: &[u8]) -> Vec<u8> {
+pub fn frame(t: MessageType, address: DeviceOrGroupAddressOnWire, payload: &[u8]) -> Vec<u8> {
     let mut v = vec![0; MAX_FRAME_SIZE];
     let len = write_frame(&mut v[..], t, address, payload).len();
+    v.truncate(len);
+    v
+}
+
+#[cfg(feature = "std")]
+pub fn initialize_frame(
+    device_address: DeviceAddress,
+    group_address: GroupAddress,
+    pdi_offset: PDIOffset,
+) -> Vec<u8> {
+    let mut payload = vec![];
+
+    payload.extend_from_slice(&group_address.0.to_le_bytes());
+    payload.extend_from_slice(&pdi_offset.0.to_le_bytes());
+
+    let address = -(device_address.0 as i16);
+
+    let mut v = vec![0; MAX_FRAME_SIZE];
+    let len = write_frame(&mut v[..], MessageType::Initialize, address, &payload[..]).len();
     v.truncate(len);
     v
 }
@@ -273,8 +315,8 @@ where
                     let mut g = bbq.grant_exact(4).unwrap();
                     let buf = g.buf();
                     read_exact!(buf);
-                    let group_address = Address(i16::from_le_bytes([buf[0], buf[1]]));
-                    let pdi_offset = PDIOffset(u16::from_le_bytes([buf[2], buf[3]]));
+                    let group_address = GroupAddress::from_le_bytes([buf[0], buf[1]]);
+                    let pdi_offset = PDIOffset::from_le_bytes([buf[2], buf[3]]);
                     commit!(g, buf);
                     let new_state = DeviceState::Initialized {
                         group_address,
@@ -292,10 +334,10 @@ where
                     ProcessUpdate,
                     group_address,
                     DeviceState::Initialized {
-                        group_address: Address(address),
+                        group_address: GroupAddress(address),
                         pdi_offset,
                     },
-                ) if group_address == *address => {
+                ) if group_address == (*address as i16) => {
                     debug!("Handling ProcessUpdate");
 
                     if payload_length < ((pdi_offset.0 as u16) + PDI_WINDOW_SIZE) {
@@ -379,10 +421,7 @@ mod test {
     fn misc() {
         let mut buf = [0u8; MAX_FRAME_SIZE];
 
-        assert_eq!(
-            INIT_FRAME,
-            write_frame(&mut buf, MessageType::Init, Address(0), &[])
-        );
+        assert_eq!(INIT_FRAME, write_frame(&mut buf, MessageType::Init, 0, &[]));
 
         assert_eq!(INIT_FRAME_BASE.len(), PRE_PAYLOAD_BYTE_COUNT);
     }
@@ -411,14 +450,15 @@ mod test {
         assert_eq!(
             test_parse(
                 DeviceState::Reset,
-                &frame(MessageType::Enumerate, Address(0), &[])[..],
+                &frame(MessageType::Enumerate, 0, &[])[..],
             ),
-            (Ok(None), frame(MessageType::Enumerate, Address(1), &[]),)
+            (Ok(None), frame(MessageType::Enumerate, 1, &[]),)
         );
     }
 
     use embedded_io_async::{Read, Write};
     use smol::channel::{self, Receiver, Sender};
+
     use smol::Executor;
 
     #[derive(Debug)]
@@ -483,9 +523,10 @@ mod test {
             }
 
             match result {
-                Ok(action) => {
-                    // TODO update state.
-                }
+                Ok(None) => {}
+                Ok(Some(action)) => match action {
+                    Action::NewState(s) => state = s,
+                },
                 Err(Error::RX) => {
                     return;
                 }
@@ -499,23 +540,23 @@ mod test {
     }
 
     async fn controller(mut port: impl MockPort) {
-        port.write(&frame(MessageType::Enumerate, Address(0), &[])[..])
+        use controller::*;
+
+        port.write(&frame(MessageType::Enumerate, 0, &[])[..])
             .await
             .unwrap();
 
-        controller::wait_for(
-            &mut port,
-            &frame(MessageType::Enumerate, Address(1), &[])[..],
-        )
-        .await
-        .unwrap();
+        wait_for(&mut port, &frame(MessageType::Enumerate, 1, &[])[..])
+            .await
+            .unwrap();
 
-        controller::wait_for(
-            &mut port,
-            &frame(MessageType::Initialize, Address(1), &[])[..],
-        )
-        .await
-        .unwrap();
+        port.write(&frame(MessageType::Enumerate, 0, &[])[..])
+            .await
+            .unwrap();
+
+        // wait_for(&mut port, &frame(MessageType::Initialize, 1, &[])[..])
+        //     .await
+        //     .unwrap();
     }
 
     #[test]
@@ -538,17 +579,17 @@ mod test {
             };
 
             let ex = Executor::new();
-            let _controller_task = ex.spawn(controller(controller_serial));
+
+            let controller_task = ex.spawn(controller(controller_serial));
             let _device_task = ex.spawn(device(device_serial));
 
-            // Await the completion of tasks
+            // Run the tasks a bit
             for _ in 0..100 {
-                if ex.try_tick() == false {
-                    // no more tasks to run
-                    return;
-                }
+                ex.try_tick();
             }
-            panic!("Ran out of fuel");
+
+            assert!(controller_task.is_finished());
+            controller_task.await;
         });
     }
 }

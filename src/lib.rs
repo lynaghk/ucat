@@ -15,13 +15,15 @@ pub use heapless::String;
 use log::*;
 use serde::{Deserialize, Serialize};
 
-// #[derive(Debug, Serialize, Deserialize)]
-// pub struct Frame<'a> {
-//     pub message_type: MessageType,
-//     pub address: Address,
-//     pub payload: &'a [u8],
-//     pub crc: u32, //CRC of everything above
-// }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Frame<'a> {
+    pub message_type: MessageType,
+    pub address: DeviceOrGroupAddressOnWire,
+    pub payload: &'a [u8],
+    pub crc: u32, //CRC of everything above
+}
+
+type DeviceOrGroupAddressOnWire = i16;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeviceAddress(pub u16);
@@ -29,6 +31,9 @@ pub struct DeviceAddress(pub u16);
 impl DeviceAddress {
     pub fn from_le_bytes(bytes: [u8; 2]) -> Self {
         DeviceAddress(u16::from_le_bytes(bytes))
+    }
+    pub fn to_wire_address(&self) -> i16 {
+        self.0 as i16
     }
 }
 
@@ -39,9 +44,10 @@ impl GroupAddress {
     pub fn from_le_bytes(bytes: [u8; 2]) -> Self {
         GroupAddress(u16::from_le_bytes(bytes))
     }
+    pub fn to_wire_address(&self) -> i16 {
+        self.0 as i16
+    }
 }
-
-type DeviceOrGroupAddressOnWire = i16;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PDIOffset(pub u16);
@@ -543,6 +549,8 @@ mod test {
     }
 
     async fn controller(mut port: impl MockPort) {
+        let mut buf = vec![0; MAX_FRAME_SIZE];
+
         use controller::*;
         ///////////////////
         // Enumerate
@@ -558,21 +566,42 @@ mod test {
 
         ///////////////////
         // Initialize
+
+        let group_address = GroupAddress(7);
+        let total_pdi_length = 1;
+
         {
-            let payload = &[
-                GroupAddress(7).0.to_le_bytes(),
-                PDIOffset(0).0.to_le_bytes(),
-            ]
-            .concat();
+            port.write(&initialize_frame(
+                DeviceAddress(1),
+                group_address,
+                PDIOffset(0),
+            ))
+            .await
+            .unwrap();
 
-            port.write(&frame(MessageType::Initialize, 1, payload)[..])
-                .await
-                .unwrap();
-
-            wait_for(&mut port, &frame(MessageType::Initialize, 2, payload)[..])
+            let _f = controller::try_parse_frame(&mut port, &mut buf)
                 .await
                 .unwrap();
         }
+
+        ///////////////////
+        // Process Update
+
+        port.write(
+            &frame(
+                MessageType::ProcessUpdate,
+                group_address.to_wire_address(),
+                &vec![0; total_pdi_length],
+            )[..],
+        )
+        .await
+        .unwrap();
+
+        let f = controller::try_parse_frame(&mut port, &mut buf)
+            .await
+            .unwrap();
+
+        assert_eq!(f.payload, [55]);
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub enum Error {
     UnexpectedResponse,
 
     #[error("{0:?}")]
+    CommonError(crate::Error),
+
+    #[error("{0:?}")]
     IO(embedded_io_async::ErrorKind),
 }
 
@@ -23,6 +26,12 @@ impl<E: embedded_io_async::Error> From<ReadExactError<E>> for Error {
             ReadExactError::UnexpectedEof => Error::UnexpectedResponse,
             ReadExactError::Other(e) => Error::IO(e.kind()),
         }
+    }
+}
+
+impl From<crate::Error> for Error {
+    fn from(err: crate::Error) -> Self {
+        Error::CommonError(err)
     }
 }
 
@@ -42,6 +51,47 @@ where
     }
 
     Ok(())
+}
+
+pub async fn try_parse_frame<R>(mut r: R, buf: &mut [u8]) -> Result<Frame, Error>
+where
+    R: embedded_io_async::Read,
+{
+    r.read_exact(&mut buf[0..PRE_PAYLOAD_BYTE_COUNT]).await?;
+
+    match MessageType::try_from(buf[0]) {
+        Err(e) => {
+            error!("Bad message type: {}", e);
+            return Err(crate::Error::BadMessageType.into());
+        }
+        Ok(message_type) => {
+            let address = DeviceOrGroupAddressOnWire::from_le_bytes([buf[1], buf[2]]);
+            let payload_length = PayloadLength::from_le_bytes([buf[3], buf[4]]) as usize;
+
+            r.read_exact(
+                &mut buf[PRE_PAYLOAD_BYTE_COUNT
+                    ..(PRE_PAYLOAD_BYTE_COUNT + payload_length + CRC_BYTE_COUNT)],
+            )
+            .await?;
+
+            let payload = &buf[PRE_PAYLOAD_BYTE_COUNT..(PRE_PAYLOAD_BYTE_COUNT + payload_length)];
+            let received_crc = &buf[(PRE_PAYLOAD_BYTE_COUNT + payload_length)
+                ..(PRE_PAYLOAD_BYTE_COUNT + payload_length + CRC_BYTE_COUNT)];
+
+            let crc = CRC.checksum(&buf[0..(PRE_PAYLOAD_BYTE_COUNT + payload_length)]);
+
+            if received_crc != crc.to_le_bytes() {
+                return Err(crate::Error::CRC.into());
+            }
+
+            Ok(Frame {
+                message_type,
+                address,
+                payload,
+                crc,
+            })
+        }
+    }
 }
 
 /// Wait for init frame, discarding non-matching bytes before it.

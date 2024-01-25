@@ -8,6 +8,8 @@ pub const MAX_FRAME_SIZE: usize = 2048;
 pub type Digest = crc::Digest<'static, u32>;
 pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
 
+use core::mem::size_of;
+
 pub use const_str::concat_bytes;
 pub use heapless::String;
 use log::*;
@@ -49,6 +51,8 @@ impl PDIOffset {
         PDIOffset(u16::from_le_bytes(bytes))
     }
 }
+
+type PayloadLength = u16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeviceInfo {
@@ -96,7 +100,8 @@ const PING_FRAME_BASE: &[u8] = &[
                 // (no payload)
 ];
 
-pub const PRE_PAYLOAD_BYTE_COUNT: usize = 1 + 2 + 2;
+pub const PRE_PAYLOAD_BYTE_COUNT: usize =
+    size_of::<MessageType>() + size_of::<DeviceOrGroupAddressOnWire>() + size_of::<PayloadLength>();
 pub const CRC_BYTE_COUNT: usize = 4;
 
 pub const PING_FRAME: &[u8] =
@@ -124,7 +129,7 @@ pub fn write_frame<'a>(
 
     write!(&[t as u8]);
     write!(&address.to_le_bytes());
-    write!(&(payload.len() as u16).to_le_bytes());
+    write!(&(payload.len() as PayloadLength).to_le_bytes());
     write!(payload);
 
     let crc = CRC.checksum(&buf[0..n]);
@@ -185,7 +190,7 @@ where
     R: embedded_io_async::Read,
 {
     ////////////
-    // TODO: move this stuff to config object
+    // TODO: move this stuff to config object. Unify with generic const N bbq size
     const CHUNK_SIZE: usize = 32;
     // TODO: derive this from postcard or something for this specific device.
     const PDI_WINDOW_SIZE: u16 = 1;
@@ -260,6 +265,7 @@ where
                 let buf = g.buf();
                 let n = read!(buf);
                 remaining -= n;
+                read_digest.update(&buf[0..n]);
                 commit!(g, &buf[0..n]);
             }
         }};
@@ -282,7 +288,7 @@ where
             ///////////////////////////////
             // read and send address
 
-            let mut address = i16::from_le_bytes([buf[1], buf[2]]);
+            let mut address = DeviceOrGroupAddressOnWire::from_le_bytes([buf[1], buf[2]]);
 
             // increment address for device-oriented messages
             if matches!(t, Enumerate | Initialize | Identify | Query) {
@@ -295,10 +301,10 @@ where
             ///////////////////////////////
             // read and send payload length
 
-            let mut g = bbq.grant_exact(2).unwrap();
+            let mut g = bbq.grant_exact(size_of::<PayloadLength>()).unwrap();
             let buf = g.buf();
             read_exact!(buf);
-            let payload_length = u16::from_le_bytes([buf[0], buf[1]]);
+            let payload_length = PayloadLength::from_le_bytes([buf[0], buf[1]]);
             commit!(g, buf);
 
             ///////////////////////////////
@@ -340,7 +346,7 @@ where
                 ) if group_address == (*address as i16) => {
                     debug!("Handling ProcessUpdate");
 
-                    if payload_length < ((pdi_offset.0 as u16) + PDI_WINDOW_SIZE) {
+                    if payload_length < (pdi_offset.0 + PDI_WINDOW_SIZE) {
                         error!("process update payload length smaller than pdi_offset + PDI_WINDOW_SIZE");
                         return Err(Error::TODO);
                     }
@@ -382,13 +388,12 @@ where
             ///////////////////////////
             // check and send CRC
             let crc_ok = {
-                let mut buf = [0u8; CRC_BYTE_COUNT];
-                read_exact_without_digest!(&mut buf);
-                let actual = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let expected = read_digest.finalize();
+                let mut actual = [0u8; CRC_BYTE_COUNT];
+                read_exact_without_digest!(&mut actual);
+                let expected = read_digest.finalize().to_le_bytes();
                 let crc_ok = actual == expected;
                 if !crc_ok {
-                    error!("Bad message CRC, expected {expected} got {actual}");
+                    error!("Bad message CRC, expected {expected:?} got {actual:?}");
                 }
 
                 let mut g = bbq.grant_exact(CRC_BYTE_COUNT).unwrap();
@@ -397,7 +402,7 @@ where
                     write_digest.finalize().to_le_bytes()
                 } else {
                     // if CRC on original message was bad, we should preserve it so that downstream devices don't act on the bad message (which we've already forwarded)
-                    buf
+                    actual
                 });
                 commit_without_digest!(g, CRC_BYTE_COUNT);
 
@@ -481,12 +486,11 @@ mod test {
     }
 
     impl Read for MockSerial {
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            // Read data from the channel
-            for item in buf.iter_mut() {
-                *item = self.reader.recv().await.map_err(|_| MockError)?;
+        async fn read(&mut self, bs: &mut [u8]) -> Result<usize, Self::Error> {
+            for b in bs.iter_mut() {
+                *b = self.reader.recv().await.map_err(|_| MockError)?;
             }
-            Ok(buf.len())
+            Ok(bs.len())
         }
     }
 
@@ -495,12 +499,11 @@ mod test {
             Ok(())
         }
 
-        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            // Write data to the channel
-            for &item in buf {
-                self.writer.send(item).await.map_err(|_| MockError)?;
+        async fn write(&mut self, bs: &[u8]) -> Result<usize, Self::Error> {
+            for &b in bs {
+                self.writer.send(b).await.map_err(|_| MockError)?;
             }
-            Ok(buf.len())
+            Ok(bs.len())
         }
     }
 
@@ -541,29 +544,42 @@ mod test {
 
     async fn controller(mut port: impl MockPort) {
         use controller::*;
+        ///////////////////
+        // Enumerate
+        {
+            port.write(&frame(MessageType::Enumerate, 0, &[])[..])
+                .await
+                .unwrap();
 
-        port.write(&frame(MessageType::Enumerate, 0, &[])[..])
-            .await
-            .unwrap();
+            wait_for(&mut port, &frame(MessageType::Enumerate, 1, &[])[..])
+                .await
+                .unwrap();
+        }
 
-        wait_for(&mut port, &frame(MessageType::Enumerate, 1, &[])[..])
-            .await
-            .unwrap();
+        ///////////////////
+        // Initialize
+        {
+            let payload = &[
+                GroupAddress(7).0.to_le_bytes(),
+                PDIOffset(0).0.to_le_bytes(),
+            ]
+            .concat();
 
-        port.write(&frame(MessageType::Enumerate, 0, &[])[..])
-            .await
-            .unwrap();
+            port.write(&frame(MessageType::Initialize, 1, payload)[..])
+                .await
+                .unwrap();
 
-        // wait_for(&mut port, &frame(MessageType::Initialize, 1, &[])[..])
-        //     .await
-        //     .unwrap();
+            wait_for(&mut port, &frame(MessageType::Initialize, 2, payload)[..])
+                .await
+                .unwrap();
+        }
     }
 
     #[test]
     fn test_controller_device_communication() {
-        // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-        //     .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
-        //     .init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+            .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
+            .init();
 
         smol::block_on(async {
             let (tx1, rx1) = channel::unbounded();
@@ -589,6 +605,7 @@ mod test {
             }
 
             assert!(controller_task.is_finished());
+            // need to await here so that any panic is propagated up and fails the test
             controller_task.await;
         });
     }

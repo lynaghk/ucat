@@ -37,6 +37,7 @@ where
     r.read_exact(&mut buf[..n]).await?;
 
     if bs != &buf[..n] {
+        debug!("Expected: {bs:?}\nGot: {buf:?}");
         return Err(Error::UnexpectedResponse);
     }
 

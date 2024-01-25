@@ -49,8 +49,8 @@ where
     R: embedded_io_async::Read,
     // wait for init frame from device
 {
-    let needle = INIT_FRAME;
-    const N: usize = INIT_FRAME.len();
+    let needle = PING_FRAME;
+    const N: usize = PING_FRAME.len();
 
     let mut buf = [0; 2 * N];
     let mut offset = 0;

@@ -79,15 +79,15 @@ pub enum MessageType {
     // device acts if assigned to this group address
     ProcessUpdate, // group address, read/write payload: PDI
 
-    Init, // only devices send this upstream once when they boot; used to determine if they are end of chain.
+    Ping, // only devices send this upstream once when they boot; used to determine if they are end of chain.
 }
 use MessageType::*;
 
 // devices send this upstream when they boot
 // TODO: put version number as "address" in here?
 // TODO: generate this at compile time so it's always synced up with frame definition
-const INIT_FRAME_BASE: &[u8] = &[
-    Init as u8, // Message Type
+const PING_FRAME_BASE: &[u8] = &[
+    Ping as u8, // Message Type
     0,          /////////////////////
     0,          // i16 address
     0,          /////////////////////
@@ -99,8 +99,8 @@ const INIT_FRAME_BASE: &[u8] = &[
 pub const PRE_PAYLOAD_BYTE_COUNT: usize = 1 + 2 + 2;
 pub const CRC_BYTE_COUNT: usize = 4;
 
-pub const INIT_FRAME: &[u8] =
-    concat_bytes!(INIT_FRAME_BASE, CRC.checksum(INIT_FRAME_BASE).to_le_bytes());
+pub const PING_FRAME: &[u8] =
+    concat_bytes!(PING_FRAME_BASE, CRC.checksum(PING_FRAME_BASE).to_le_bytes());
 
 // TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs --- oh, someone made a crate https://github.com/Eolu/const-gen
 // TODO: compare generated code here with a fn where I do all of the slice offset math myself.
@@ -365,7 +365,7 @@ where
                     // message for another device, nothing for us to do
                     None
                 }
-                (Init, _, _) => {
+                (Ping, _, _) => {
                     error!("Device recieved Init message from Controller");
                     return Err(Error::TODO);
                 }
@@ -421,9 +421,9 @@ mod test {
     fn misc() {
         let mut buf = [0u8; MAX_FRAME_SIZE];
 
-        assert_eq!(INIT_FRAME, write_frame(&mut buf, MessageType::Init, 0, &[]));
+        assert_eq!(PING_FRAME, write_frame(&mut buf, MessageType::Ping, 0, &[]));
 
-        assert_eq!(INIT_FRAME_BASE.len(), PRE_PAYLOAD_BYTE_COUNT);
+        assert_eq!(PING_FRAME_BASE.len(), PRE_PAYLOAD_BYTE_COUNT);
     }
 
     fn test_parse(state: DeviceState, frame: &[u8]) -> (Result<Option<Action>, Error>, Vec<u8>) {

@@ -17,6 +17,9 @@ bbqueue = "0.5"
 log = "0.4"
 thiserror = { version = "1.0", package = "thiserror-core", default-features = false }
 
+# TODO: Use this to communicate between frame handling thread and status/command thread?
+# atomic_pingpong = "0.2.3"
+
 
 [dev-dependencies]
 smol = "2"

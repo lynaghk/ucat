@@ -181,25 +181,26 @@ pub enum Error {
     BadMessageType,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub enum Action {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Action<const PDI_WINDOW_SIZE: usize> {
     NewState(DeviceState),
+    // TODO: should this be a reference rather than allocated on the stack?
+    NewCommand([u8; PDI_WINDOW_SIZE]),
 }
 
-pub async fn try_parse_frame<R, const N: usize>(
+pub async fn handle_frame<R, const N: usize, const PDI_WINDOW_SIZE: usize>(
     state: DeviceState,
+    latest_status: &[u8; PDI_WINDOW_SIZE],
     mut rx: R,
     bbq: &mut Producer<'_, N>,
     data_available: impl Fn(),
-) -> Result<Option<Action>, Error>
+) -> Result<Option<Action<PDI_WINDOW_SIZE>>, Error>
 where
     R: embedded_io_async::Read,
 {
     ////////////
     // TODO: move this stuff to config object. Unify with generic const N bbq size
     const CHUNK_SIZE: usize = 32;
-    // TODO: derive this from postcard or something for this specific device.
-    const PDI_WINDOW_SIZE: u16 = 1;
 
     let mut read_digest = CRC.digest();
     let mut write_digest = CRC.digest();
@@ -352,25 +353,19 @@ where
                 ) if group_address == (*address as i16) => {
                     debug!("Handling ProcessUpdate");
 
-                    if payload_length < (pdi_offset.0 + PDI_WINDOW_SIZE) {
+                    if payload_length < (pdi_offset.0 + PDI_WINDOW_SIZE as u16) {
                         error!("process update payload length smaller than pdi_offset + PDI_WINDOW_SIZE");
                         return Err(Error::TODO);
                     }
                     forward!(pdi_offset.0 as usize);
 
-                    // TODO get latest payload for real
-                    let pdi_write = [55u8; PDI_WINDOW_SIZE as usize];
-                    write!(&pdi_write);
+                    write!(latest_status);
 
-                    let mut pdi_read = [0u8; PDI_WINDOW_SIZE as usize];
-                    read_exact!(&mut pdi_read[..]);
+                    let mut buf = [0u8; PDI_WINDOW_SIZE];
+                    read_exact!(&mut buf[..]);
+                    debug!("process update read: {buf:?}");
 
-                    info!("process update read: {pdi_read:?}");
-
-                    // TODO: who owns PDI buffer?
-                    //Some(Action::PDIUpdate)
-
-                    None
+                    Some(Action::NewCommand(buf))
                 }
 
                 (Initialize | Identify | Query | ProcessUpdate, _, _) => {
@@ -437,12 +432,14 @@ mod test {
         assert_eq!(PING_FRAME_BASE.len(), PRE_PAYLOAD_BYTE_COUNT);
     }
 
-    fn test_parse(state: DeviceState, frame: &[u8]) -> (Result<Option<Action>, Error>, Vec<u8>) {
+    fn test_parse(state: DeviceState, frame: &[u8]) -> (Result<Option<Action<1>>, Error>, Vec<u8>) {
         smol::block_on(async move {
             let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
             let (mut producer, mut consumer) = bbq.try_split().unwrap();
 
-            let result = try_parse_frame(state, frame, &mut producer, || {}).await;
+            let latest_status = [7u8];
+
+            let result = handle_frame(state, &latest_status, frame, &mut producer, || {}).await;
 
             let mut downstream = vec![];
             while let Ok(g) = consumer.read() {
@@ -516,13 +513,23 @@ mod test {
     trait MockPort: Read<Error = MockError> + Write<Error = MockError> {}
     impl MockPort for MockSerial {}
 
+    const STUB_RAW_STATUS: u8 = 55;
+
     async fn device(mut port: impl MockPort) {
         let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
         let (mut producer, mut consumer) = bbq.try_split().unwrap();
 
         let mut state = DeviceState::Reset;
+        let latest_status = [STUB_RAW_STATUS; 1];
         loop {
-            let result = try_parse_frame(state.clone(), &mut port, &mut producer, || {}).await;
+            let result = handle_frame(
+                state.clone(),
+                &latest_status,
+                &mut port,
+                &mut producer,
+                || {},
+            )
+            .await;
 
             while let Ok(g) = consumer.read() {
                 let buf = g.buf();
@@ -535,6 +542,7 @@ mod test {
                 Ok(None) => {}
                 Ok(Some(action)) => match action {
                     Action::NewState(s) => state = s,
+                    Action::NewCommand(_buf) => {}
                 },
                 Err(Error::RX) => {
                     return;
@@ -601,7 +609,7 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(f.payload, [55]);
+        assert_eq!(f.payload, [STUB_RAW_STATUS]);
     }
 
     #[test]

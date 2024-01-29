@@ -37,6 +37,68 @@ parsing options:
 
 ## Log
 
+### Jan 26 - API design help
+
+API design for communicating with heterogeneous devices
+
+I'm designing a communications protocol for a chain of heterogeneous embedded devices (different sensors, etc.), but I'm not sure how to design an ergonomic API that's both:
+
+- type-safe
+- suitable for no-std usage (i.e., without `dyn` and allocations)
+
+Conceptually things would compile down into something like:
+
+```rust
+let mut message = [0u8; A::Length + A::Length + B::Length];
+
+//command device 1 (type A)
+A::write_commmand(&mut message[0..1], A::Command::Foo);
+
+//command device 2 (type A)
+A::write_commmand(&mut message[1..2], A::Command::Bar);
+
+//command device 3 (type B)
+B::write_commmand(&mut message[2..4], B::Command::Baz);
+
+let response = send(&message);
+
+//read statuses
+let d1: A::Status = A::read_status(&mut response[0..1]);
+let d2: A::Status = A::read_status(&mut response[1..2]);
+let d3: B::Status = B::read_status(&mut response[2..4]);
+```
+
+The topology (here, a chain of `[A, A, B]`) is known at compile-time, as are the status/command sizes.
+Is it possible in Rust to define the topology once (in a function/macro invocation or data structure) and handle all of the buffer size and offset calculations behind the scenes?
+Ideally the user-facing code would look something like:
+
+```rust
+let mut network = network![A, A, B];
+network[0].write(A::Command::Foo);
+network[1].write(A::Command::Bar);
+network[2].write(B::Command::Baz);
+send(&network.message);
+
+let d1: A::Status = network[0].status;
+let d2: A::Status = network[1].status;
+let d3: B::Status = network[2].status;
+```
+
+I've tried to implement with
+
+```rust
+trait Device {
+    type Message;
+    const MESSAGE_LENGTH: usize;
+}
+```
+
+but immediately run into object safety issues so figured I should ask for help to see if there are other patterns I should be exploring to solve this. Thanks!
+
+, but haven't been able to get anywhere close to a succient API 
+
+
+
 ### Jan 19 - embassy size
 wondered if embassy would even fit on smaller stm32g0.
 as of 871d82de their blinky example is 

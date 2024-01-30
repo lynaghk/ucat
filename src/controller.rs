@@ -121,3 +121,68 @@ where
         }
     }
 }
+
+// macro_rules! setup_network {
+//     ( $( ($name:ident, $mod:ident) ),* ) => {
+
+//         let mut pdi_offset = 0;
+
+//         $(
+//           #[allow(unused_variables)]
+//           let $name = $mod::Device{pdi_offset};
+//           pdi_offset += $mod::PDI_WINDOW_SIZE;
+//         )*
+
+//        #[allow(unused_variables)]
+
+//        // TODO: this should be const
+//        let pdi_size = pdi_offset;
+//     };
+// }
+
+// Can people write Rust macros without ChatGPT?
+#[macro_export]
+macro_rules! setup_network {
+    // Entry point: Start the recursion with initial values
+    ( $offsets: ident, $( ($name:ident, $mod:ident) ),* ) => {
+
+        const NUM_DEVICES: usize = setup_network!(@count_devices 0, $(($name, $mod)),*);
+
+        const PDI_SIZE: usize = setup_network!(@total_size 0, $(($name, $mod)),*);
+
+        // TODO: figure out how to do this at compile time.
+        // using a local requires passing in the $offsets identifier so everything will be in scope for the caller.
+        #[allow(non_snake_case)]
+        let mut $offsets = [0usize; NUM_DEVICES];
+
+        setup_network!(@run 0, 0, $offsets, $(($name, $mod)),*);
+
+    };
+
+    // Count the number of devices
+    (@count_devices $count:expr, ) => {
+        $count
+    };
+    (@count_devices $count:expr, ($name:ident, $mod:ident) $(, ($next_name:ident, $next_mod:ident))*) => {
+        setup_network!(@count_devices $count + 1, $(($next_name, $next_mod)),*)
+    };
+
+    // Accumulate total PDI size
+    (@total_size $pdi_offset:expr, ) => {
+        $pdi_offset
+    };
+    (@total_size $pdi_offset:expr, ($name:ident, $mod:ident) $(, ($next_name:ident, $next_mod:ident))* ) => {
+        setup_network!(@total_size ($pdi_offset + $mod::PDI_WINDOW_SIZE), $(($next_name, $next_mod)),*)
+    };
+
+    // Setup
+    (@run $idx: expr, $pdi_offset: expr, $offsets:ident, ) => {
+        // done
+    };
+    (@run $idx: expr, $pdi_offset: expr, $offsets:ident, ($name:ident, $mod:ident) $(, ($next_name:ident, $next_mod:ident))* ) => {
+       #[allow(unused_variables)]
+        let $name: $mod::Device = $mod::Device { pdi_offset: $pdi_offset };
+        $offsets[$idx] = $pdi_offset;
+        setup_network!(@run ($idx + 1), ($pdi_offset + $mod::PDI_WINDOW_SIZE), $offsets, $(($next_name, $next_mod)),*)
+    };
+}

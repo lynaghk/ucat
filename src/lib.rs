@@ -8,6 +8,14 @@ pub const MAX_FRAME_SIZE: usize = 2048;
 pub type Digest = crc::Digest<'static, u32>;
 pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
 
+trait Device {
+    type Command;
+    type Status;
+
+    fn status(&self, pdi: &[u8]) -> Self::Status;
+    fn command(&self, pdi: &mut [u8], cmd: Option<&Self::Command>);
+}
+
 use core::mem::size_of;
 
 pub use const_str::concat_bytes;
@@ -513,14 +521,18 @@ mod test {
     trait MockPort: Read<Error = MockError> + Write<Error = MockError> {}
     impl MockPort for MockSerial {}
 
-    const STUB_RAW_STATUS: u8 = 55;
-
-    async fn device(mut port: impl MockPort) {
+    async fn device<const PDI_WINDOW_SIZE: usize>(
+        mut port: impl MockPort,
+        cb: fn(status: &mut [u8], cmd: [u8; PDI_WINDOW_SIZE]),
+    ) {
         let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
         let (mut producer, mut consumer) = bbq.try_split().unwrap();
 
         let mut state = DeviceState::Reset;
-        let latest_status = [STUB_RAW_STATUS; 1];
+        // TODO: how should device initialize default status?
+        // should there be rust protocol around this, or is it just up to device firmware implementors?
+        let mut latest_status = [0u8; PDI_WINDOW_SIZE];
+
         loop {
             let result = handle_frame(
                 state.clone(),
@@ -542,7 +554,7 @@ mod test {
                 Ok(None) => {}
                 Ok(Some(action)) => match action {
                     Action::NewState(s) => state = s,
-                    Action::NewCommand(_buf) => {}
+                    Action::NewCommand(cmd) => cb(&mut latest_status[..], cmd),
                 },
                 Err(Error::RX) => {
                     return;
@@ -557,9 +569,21 @@ mod test {
     }
 
     async fn controller(mut port: impl MockPort) {
-        let mut buf = vec![0; MAX_FRAME_SIZE];
+        let mut buf_res = vec![0; MAX_FRAME_SIZE];
 
         use controller::*;
+
+        use test::devices::{counter, echoer};
+
+        setup_network!(PDI_OFFSETS, (c1, counter), (e1, echoer));
+
+        let mut buf_cmd = vec![0; PDI_SIZE];
+
+        // TODO: make this part of network macro? That would require it to allocate a PDI_SIZE'd buffer rather than letting caller do it.
+        // alternatively, generate a closure to populate a buffer?
+        c1.command(&mut buf_cmd, None);
+        e1.command(&mut buf_cmd, None);
+
         ///////////////////
         // Enumerate
         {
@@ -567,53 +591,87 @@ mod test {
                 .await
                 .unwrap();
 
-            wait_for(&mut port, &frame(MessageType::Enumerate, 1, &[])[..])
-                .await
-                .unwrap();
+            wait_for(
+                &mut port,
+                &frame(MessageType::Enumerate, NUM_DEVICES as i16, &[])[..],
+            )
+            .await
+            .unwrap();
         }
 
         ///////////////////
         // Initialize
 
         let group_address = GroupAddress(7);
-        let total_pdi_length = 1;
 
-        {
+        for (idx, offset) in PDI_OFFSETS.iter().enumerate() {
             port.write(&initialize_frame(
-                DeviceAddress(1),
+                DeviceAddress((idx + 1) as u16),
                 group_address,
-                PDIOffset(0),
+                PDIOffset(*offset as u16),
             ))
             .await
             .unwrap();
 
-            let _f = controller::try_parse_frame(&mut port, &mut buf)
+            let _f = controller::try_parse_frame(&mut port, &mut buf_res)
                 .await
                 .unwrap();
         }
 
         ///////////////////
-        // Process Update
+        // Process Update 1
+
+        c1.command(&mut buf_cmd, Some(&counter::Command::Increment));
+        e1.command(&mut buf_cmd, Some(&echoer::Command::SetValue(17)));
 
         port.write(
             &frame(
                 MessageType::ProcessUpdate,
                 group_address.to_wire_address(),
-                &vec![0; total_pdi_length],
+                &buf_cmd,
             )[..],
         )
         .await
         .unwrap();
 
-        let f = controller::try_parse_frame(&mut port, &mut buf)
+        let f = controller::try_parse_frame(&mut port, &mut buf_res)
             .await
             .unwrap();
 
-        assert_eq!(f.payload, [STUB_RAW_STATUS]);
+        // Even though we sent commands, the statuses returned will be those before those commands were processed by the devices.
+        assert!(matches!(c1.status(f.payload), counter::Status::Value(0)));
+        assert!(matches!(e1.status(f.payload), echoer::Status::NoValueSet));
+
+        ///////////////////
+        // Process Update 2
+
+        c1.command(&mut buf_cmd, None);
+        e1.command(&mut buf_cmd, None);
+
+        port.write(
+            &frame(
+                MessageType::ProcessUpdate,
+                group_address.to_wire_address(),
+                &buf_cmd,
+            )[..],
+        )
+        .await
+        .unwrap();
+
+        let f = controller::try_parse_frame(&mut port, &mut buf_res)
+            .await
+            .unwrap();
+
+        // TODO: how to improve tests here? When `matches!` fails it doesn't say what the actual value was.
+        // Now we expect the results from Process Update 1 to be reported.
+        assert!(matches!(c1.status(f.payload), counter::Status::Value(1)));
+        assert!(matches!(e1.status(f.payload), echoer::Status::ValueSet(17)));
     }
 
     #[test]
     fn test_controller_device_communication() {
+        use test::devices::{counter, echoer};
+
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
             .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
             .init();
@@ -621,23 +679,54 @@ mod test {
         smol::block_on(async {
             let (tx1, rx1) = channel::unbounded();
             let (tx2, rx2) = channel::unbounded();
-
-            let controller_serial = MockSerial {
-                reader: rx2,
-                writer: tx1,
-            };
-            let device_serial = MockSerial {
-                reader: rx1,
-                writer: tx2,
-            };
+            let (tx3, rx3) = channel::unbounded();
 
             let ex = Executor::new();
 
-            let controller_task = ex.spawn(controller(controller_serial));
-            let _device_task = ex.spawn(device(device_serial));
+            let controller_task = ex.spawn(controller(MockSerial {
+                reader: rx3,
+                writer: tx1,
+            }));
+
+            let _device1_task = ex.spawn(device(
+                MockSerial {
+                    reader: rx1,
+                    writer: tx2,
+                },
+                |status, cmd: [u8; counter::PDI_WINDOW_SIZE]| {
+                    if let Some(cmd) =
+                        postcard::from_bytes::<Option<counter::Command>>(&cmd).unwrap()
+                    {
+                        let old = postcard::from_bytes::<counter::Status>(status).unwrap();
+                        match (old, cmd) {
+                            (counter::Status::Value(v), counter::Command::Increment) => {
+                                postcard::to_slice(&counter::Status::Value(v + 1), status).unwrap();
+                            }
+                        }
+                    }
+                },
+            ));
+
+            let _device2_task = ex.spawn(device(
+                MockSerial {
+                    reader: rx2,
+                    writer: tx3,
+                },
+                |status, cmd: [u8; echoer::PDI_WINDOW_SIZE]| {
+                    if let Some(cmd) =
+                        postcard::from_bytes::<Option<echoer::Command>>(&cmd).unwrap()
+                    {
+                        let new = match cmd {
+                            echoer::Command::SetValue(v) => echoer::Status::ValueSet(v),
+                            echoer::Command::ClearValue => echoer::Status::NoValueSet,
+                        };
+                        postcard::to_slice(&new, status).unwrap();
+                    }
+                },
+            ));
 
             // Run the tasks a bit
-            for _ in 0..100 {
+            for _ in 0..500 {
                 ex.try_tick();
             }
 
@@ -645,5 +734,84 @@ mod test {
             // need to await here so that any panic is propagated up and fails the test
             controller_task.await;
         });
+    }
+
+    mod devices {
+
+        // TODO: Is there a nicer way for this default device impl without a macro? Need generics on modules
+        #[macro_export]
+        macro_rules! device_impl {
+            () => {
+                pub struct Device {
+                    pub pdi_offset: usize,
+                }
+
+                impl crate::Device for Device {
+                    type Status = Status;
+                    type Command = Command;
+
+                    fn status(&self, pdi: &[u8]) -> Status {
+                        postcard::from_bytes(
+                            &pdi[self.pdi_offset..(self.pdi_offset + PDI_WINDOW_SIZE)],
+                        )
+                        .unwrap()
+                    }
+
+                    fn command(&self, pdi: &mut [u8], cmd: Option<&Command>) {
+                        postcard::to_slice(
+                            &cmd,
+                            &mut pdi[self.pdi_offset..(self.pdi_offset + PDI_WINDOW_SIZE)],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+        }
+
+        pub mod echoer {
+            use postcard::experimental::max_size::MaxSize;
+            use serde::{Deserialize, Serialize};
+
+            // TODO:
+            // const fn max(a: usize, b: usize) -> usize {
+            //     [a, b][(a < b) as usize]
+            // }
+
+            // TODO: core::cmp::max isn't max, so just waste a bunch of bytes. Ugh, Rust.
+            pub const PDI_WINDOW_SIZE: usize =
+                Option::<Command>::POSTCARD_MAX_SIZE + Status::POSTCARD_MAX_SIZE;
+
+            #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+            pub enum Command {
+                SetValue(u8),
+                ClearValue,
+            }
+            #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+            pub enum Status {
+                NoValueSet,
+                ValueSet(u8),
+            }
+
+            super::super::device_impl!();
+        }
+
+        pub mod counter {
+            use postcard::experimental::max_size::MaxSize;
+            use serde::{Deserialize, Serialize};
+
+            pub const PDI_WINDOW_SIZE: usize =
+                Option::<Command>::POSTCARD_MAX_SIZE + Status::POSTCARD_MAX_SIZE;
+
+            #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+            pub enum Command {
+                Increment,
+            }
+            #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+            pub enum Status {
+                Value(u8),
+            }
+
+            super::super::device_impl!();
+        }
     }
 }

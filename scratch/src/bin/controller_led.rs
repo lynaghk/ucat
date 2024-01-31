@@ -36,7 +36,32 @@ impl Write for Port {
     }
 }
 
+use eui::*;
+
+use ucat::device::led;
+use ucat::device::led::{Color, Light};
+
 pub fn main() -> anyhow::Result<()> {
+    #[eui]
+    struct Foo {}
+
+    #[eui]
+    #[derive(Debug)]
+    struct C {
+        a: Light,
+        b: Light,
+    };
+
+    impl Status for Foo {}
+    impl Command for C {}
+
+    let (cmd_tx, mut cmd_rx) = channel::<C>(64);
+    let (status_tx, status_rx) = channel::<Foo>(64);
+
+    std::thread::spawn(|| {
+        serve_blocking("127.0.0.1:8080", status_rx, cmd_tx);
+    });
+
     smol::block_on(async {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
             .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
@@ -47,9 +72,6 @@ pub fn main() -> anyhow::Result<()> {
             .set_timeout(std::time::Duration::from_millis(1000000000000))?;
 
         let mut incoming = vec![0; MAX_FRAME_SIZE];
-
-        use ucat::device::led;
-        use ucat::device::led::{Color, Light};
 
         setup_network!(PDI_OFFSETS, (l1, led));
 
@@ -142,8 +164,25 @@ pub fn main() -> anyhow::Result<()> {
         }
 
         loop {
-            let n = port.read(&mut incoming[..]).await.unwrap();
-            info!("{:?}", &incoming[0..n]);
+            // let n = port.read(&mut incoming[..]).await.unwrap();
+            // info!("{:?}", &incoming[0..n]);
+
+            while let Ok(c) = cmd_rx.try_recv() {
+                l1.command(&mut buf_cmd, Some(&c.a));
+                port.write_all(
+                    &frame(
+                        MessageType::ProcessUpdate,
+                        group_address.to_wire_address(),
+                        &buf_cmd,
+                    )[..],
+                )
+                .await
+                .unwrap();
+
+                let f = controller::try_parse_frame(&mut port, &mut incoming)
+                    .await
+                    .unwrap();
+            }
         }
 
         Ok(())

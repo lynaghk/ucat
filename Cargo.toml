@@ -11,6 +11,9 @@ num_enum = { version = "0.7", default-features = false }
 crc = "3"
 const-str = "0.5"
 
+# TODO: pull this out into device crate just for derive schema. Maybe make that crate available separately.
+eui = { path = "../eui", optional = true }
+
 embedded-io = "0.6"
 embedded-io-async = "0.6"
 bbqueue = "0.5"
@@ -27,5 +30,6 @@ env_logger = "*"
 futures-lite = { version = "2.0.0", default-features = false }
 
 [features]
-default = ["std"]
+default = ["std", "eui"]
 std = ["postcard/use-std"]
+

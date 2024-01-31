@@ -33,13 +33,18 @@ pub mod led {
     use serde::{Deserialize, Serialize};
     pub const PDI_WINDOW_SIZE: usize = Option::<Light>::POSTCARD_MAX_SIZE;
 
+    #[cfg(feature = "eui")]
+    use eui::*;
+
     #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+    #[cfg_attr(feature = "eui", derive(eui::eui_derive::Schema))]
     pub enum Light {
         Off,
         On(Color),
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+    #[cfg_attr(feature = "eui", derive(eui::eui_derive::Schema))]
     pub struct Color {
         pub r: u8,
         pub g: u8,

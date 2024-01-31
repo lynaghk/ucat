@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ucat = { path = "../" }
+eui = { path = "../../eui" }
 anyhow = "*"
 crc = "3.0.1"
 postcard = { version = "1.0.8", features = ["use-std"] }

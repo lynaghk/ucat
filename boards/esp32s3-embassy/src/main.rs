@@ -3,6 +3,7 @@
 #![feature(type_alias_impl_trait)]
 #![allow(non_camel_case_types)]
 
+use bbqueue::{BBBuffer, Consumer, Producer};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
 use esp32s3_hal::{clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, Rmt, IO};
@@ -14,9 +15,10 @@ use esp_hal_common::{
 };
 use futures::future::FutureExt;
 use log::*;
+use smart_leds::SmartLedsWrite;
 use static_cell::make_static;
 
-use ucat::*;
+use ucat::{device::led::Light, *};
 
 // TODO: seems to be brutal to try and create generic tasks: https://github.com/embassy-rs/embassy/issues/1837
 // if I need to share RMT across tasks, may be best to just Peripherals::steal() ...
@@ -80,11 +82,67 @@ async fn upstream_reader(
     mut rx: UartRx<'static, UPSTREAM_UART>,
     mut downstream: QueueProducer,
     data_available: DataAvailableSignal,
+    // TODO: factor the actual LED logic. I tried passing in a closure here, but...rust.
+    rmt: Rmt<'static>,
+    pin: GpioPin<Unknown, 38>,
 ) {
-    let state = DeviceState::Reset;
+    let mut state = DeviceState::Reset;
+    let mut latest_status = [0u8; PDI_WINDOW_SIZE];
     let data_available = || data_available.signal(());
+
+    // TODO: move this into shared schema crate, not ucat.
+    use ucat::device::led::{postcard, Color, Command, Light, Status, PDI_WINDOW_SIZE};
+    let mut led = {
+        let ch = rmt.channel0;
+        let mut led =
+            esp_hal_smartled::SmartLedsAdapter::new(ch, pin, esp_hal_smartled::smartLedBuffer!(1));
+
+        move |l: &Light| {
+            use smart_leds::RGB8;
+            let c = match l {
+                device::led::Light::Off => RGB8 { r: 0, g: 0, b: 0 },
+                device::led::Light::On(Color { r, g, b }) => RGB8 {
+                    r: *r,
+                    g: *g,
+                    b: *b,
+                },
+            };
+            let _ = led.write([c].into_iter());
+
+            let status: &Status = l;
+            postcard::to_slice(&status, &mut latest_status).unwrap();
+        }
+    };
+
+    // set initial status
+    led(&Light::On(Color { r: 0, g: 10, b: 0 }));
+
     loop {
-        let _ = try_parse_frame(state.clone(), &mut rx, &mut downstream, data_available).await;
+        let result = handle_frame(
+            state.clone(),
+            &latest_status,
+            &mut rx,
+            &mut downstream,
+            data_available,
+        )
+        .await;
+
+        match result {
+            Ok(None) => {}
+            Ok(Some(action)) => match action {
+                Action::NewState(s) => state = s,
+                Action::NewCommand(cmd) => {
+                    if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
+                        led(&cmd);
+                    }
+                }
+            },
+
+            Err(e) => {
+                error!("Unexpected device error: {e:?}");
+                return;
+            }
+        }
     }
 }
 
@@ -233,7 +291,7 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     // give upstream neighbor time to boot up, then send it init message
     Timer::after(Duration::from_millis(20)).await;
-    embedded_io_async::Write::write(&mut utx, &INIT_FRAME)
+    embedded_io_async::Write::write(&mut utx, &PING_FRAME)
         .await
         .unwrap();
 
@@ -241,30 +299,33 @@ async fn main(spawner: embassy_executor::Spawner) {
     boot_delay.await;
 
     let device_at_end = {
-        let mut buf = [0; INIT_FRAME.len()];
+        let mut buf = [0; PING_FRAME.len()];
         match embedded_io_async::Read::read_exact(&mut drx, &mut buf).now_or_never() {
-            Some(Ok(())) if buf == INIT_FRAME => false,
+            Some(Ok(())) if buf == PING_FRAME => false,
             _ => true,
         }
     };
 
     info!("Device at end: {device_at_end}");
 
+    let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
+    let pin = io.pins.gpio38;
+
     if device_at_end {
-        spawner.spawn(upstream_reader(urx, up, uda)).ok();
+        spawner.spawn(upstream_reader(urx, up, uda, rmt, pin)).ok();
         spawner.spawn(upstream_writer(utx, uc, uda)).ok();
     } else {
-        spawner.spawn(upstream_reader(urx, dp, dda)).ok();
+        spawner.spawn(upstream_reader(urx, dp, dda, rmt, pin)).ok();
         spawner.spawn(downstream_writer(dtx, dc, dda)).ok();
         spawner.spawn(downstream_reader(drx, up, uda)).ok();
         spawner.spawn(upstream_writer(utx, uc, uda)).ok();
     }
 
     // Blinky LED
-    {
-        let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
-        spawner.spawn(led(rmt, io.pins.gpio38)).ok();
-    }
+    // {
+    //     let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
+    //     spawner.spawn(led(rmt, io.pins.gpio38)).ok();
+    // }
 
     info!("Tasks spawned");
 

@@ -592,6 +592,7 @@ dependencies = [
  "bbqueue",
  "const-str",
  "crc",
+ "embedded-io 0.6.1",
  "embedded-io-async",
  "heapless 0.8.0",
  "log",

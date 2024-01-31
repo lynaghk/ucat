@@ -3,12 +3,14 @@
 
 pub mod controller;
 
+pub mod device;
+
 pub const MAX_FRAME_SIZE: usize = 2048;
 
 pub type Digest = crc::Digest<'static, u32>;
 pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
 
-trait Device {
+pub trait Device {
     type Command;
     type Status;
 
@@ -737,37 +739,6 @@ mod test {
     }
 
     mod devices {
-
-        // TODO: Is there a nicer way for this default device impl without a macro? Need generics on modules
-        #[macro_export]
-        macro_rules! device_impl {
-            () => {
-                pub struct Device {
-                    pub pdi_offset: usize,
-                }
-
-                impl crate::Device for Device {
-                    type Status = Status;
-                    type Command = Command;
-
-                    fn status(&self, pdi: &[u8]) -> Status {
-                        postcard::from_bytes(
-                            &pdi[self.pdi_offset..(self.pdi_offset + PDI_WINDOW_SIZE)],
-                        )
-                        .unwrap()
-                    }
-
-                    fn command(&self, pdi: &mut [u8], cmd: Option<&Command>) {
-                        postcard::to_slice(
-                            &cmd,
-                            &mut pdi[self.pdi_offset..(self.pdi_offset + PDI_WINDOW_SIZE)],
-                        )
-                        .unwrap();
-                    }
-                }
-            };
-        }
-
         pub mod echoer {
             use postcard::experimental::max_size::MaxSize;
             use serde::{Deserialize, Serialize};
@@ -792,7 +763,7 @@ mod test {
                 ValueSet(u8),
             }
 
-            super::super::device_impl!();
+            crate::device_impl!();
         }
 
         pub mod counter {
@@ -811,7 +782,7 @@ mod test {
                 Value(u8),
             }
 
-            super::super::device_impl!();
+            crate::device_impl!();
         }
     }
 }

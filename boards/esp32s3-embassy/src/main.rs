@@ -96,8 +96,7 @@ async fn upstream_reader(
         let ch = rmt.channel0;
         let mut led =
             esp_hal_smartled::SmartLedsAdapter::new(ch, pin, esp_hal_smartled::smartLedBuffer!(1));
-
-        move |l: &Light| {
+        move |l: &Light, latest_status: &mut [u8]| {
             use smart_leds::RGB8;
             let c = match l {
                 device::led::Light::Off => RGB8 { r: 0, g: 0, b: 0 },
@@ -108,40 +107,47 @@ async fn upstream_reader(
                 },
             };
             let _ = led.write([c].into_iter());
-
+            info!("cmd: {:?}", l);
             let status: &Status = l;
-            postcard::to_slice(&status, &mut latest_status).unwrap();
+            postcard::to_slice(status, latest_status).unwrap();
         }
     };
 
     // set initial status
-    led(&Light::On(Color { r: 0, g: 10, b: 0 }));
+    led(&Light::On(Color { r: 0, g: 10, b: 0 }), &mut latest_status);
 
+    // TODO: use rx idle timeout interrupt rather than embassy timeout here.
+    let timeout = Duration::from_millis(500);
     loop {
-        let result = handle_frame(
+        let f = handle_frame(
             state.clone(),
             &latest_status,
             &mut rx,
             &mut downstream,
             data_available,
-        )
-        .await;
+        );
 
-        match result {
-            Ok(None) => {}
-            Ok(Some(action)) => match action {
-                Action::NewState(s) => state = s,
-                Action::NewCommand(cmd) => {
-                    if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
-                        led(&cmd);
+        match embassy_time::with_timeout(timeout, f).await {
+            Err(_) => {
+                error!("Timed out waiting for message");
+                continue;
+            }
+            Ok(result) => match result {
+                Ok(None) => {}
+                Ok(Some(action)) => match action {
+                    Action::NewState(s) => state = s,
+                    Action::NewCommand(cmd) => {
+                        if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
+                            led(&cmd, &mut latest_status);
+                        }
                     }
+                },
+
+                Err(e) => {
+                    error!("Unexpected device error: {e:?}");
+                    return;
                 }
             },
-
-            Err(e) => {
-                error!("Unexpected device error: {e:?}");
-                return;
-            }
         }
     }
 }

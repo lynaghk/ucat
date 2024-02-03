@@ -86,12 +86,18 @@ async fn upstream_reader(
     rmt: Rmt<'static>,
     pin: GpioPin<Unknown, 38>,
 ) {
+    // TODO: move this into shared schema crate, not ucat.
+    use ucat::device::led::{postcard, Color, Led, Light, PDI_WINDOW_SIZE};
+
+    type Status = <Led as Device>::Status;
+    type Command = <Led as Device>::Command;
+
     let mut state = DeviceState::Reset;
     let mut latest_status = [0u8; PDI_WINDOW_SIZE];
+    let mut command_buf = [0u8; PDI_WINDOW_SIZE];
+
     let data_available = || data_available.signal(());
 
-    // TODO: move this into shared schema crate, not ucat.
-    use ucat::device::led::{postcard, Color, Command, Light, Status, PDI_WINDOW_SIZE};
     let mut led = {
         let ch = rmt.channel0;
         let mut led =
@@ -122,6 +128,7 @@ async fn upstream_reader(
         let f = handle_frame(
             state.clone(),
             &latest_status,
+            &mut command_buf[..],
             &mut rx,
             &mut downstream,
             data_available,

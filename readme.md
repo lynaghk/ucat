@@ -7,7 +7,11 @@ cargo install --locked --root ".cargo-installed/" --version 2.1.0 espflash
 
 espup install --targets esp32s3,esp32c3
 
+## Protocol invariants
 
+- single frame on network at a time
+- pdi_window of all zeros should be interpreted as "no command"
+- end device must buffer entire frame in memory so no devices need to worry about simultanious send/recv.
 
 ## Roadmap
 
@@ -33,9 +37,24 @@ esp32s3 has UART_LOOPBACK in hardware --- could use this to avoid DMA entirely!?
 parsing options:
   https://github.com/sharksforarms/deku
   https://docs.rs/binrw/latest/binrw/ - maybe faster than serde? keep retrying on stream.
-
-
+  
+  
 ## Log
+### Feb 2 - API design
+
+I didn't like where the macro complexity was going, so decided to try the controller network setup API again.
+
+If I want to decouple setup/construction from network calls, it's not clear where to store the necessary info.
+A central object needs to track the running PDI offsets so it can assign new devices.
+But then to initialize the devices later it'll need to know each device's PDI offset so it can tell them.
+
+This means either storing the same info multiple times (in central object and device objects) or making API awkward where you have to pass device objects back in the same order during initialization.
+
+It seems tidier to make the network client mutable and just do async calls during construction.
+There'd be unnecessary rework if you re-initialize the network, but I'm not too worried about that.
+
+I might as well have the network hold a reference to the buffer it uses too, so that doesn't need to be passed into every device call.
+the devices would just need to get a handle on the network object when reading/writing.
 
 ### Jan 26 - API design help
 
@@ -232,3 +251,11 @@ Frame
 
 
 Also looked into stm32 "passthrough" DMA --- seems like it'll be tricker than I expected, since the DMA peripheral requires a number of bytes to transfer --- so I'd need to setup a buffer and do a bit of CPU intervention to actually count the bytes transferred and handle the remainder.
+
+
+## Lessons / changes 
+Started with PDI_WINDOW_SIZE as const, but made dynamic to support runtime configuration. Rust consts too annoying to shuffle around everywhere.
+
+
+## Thanks
+Thanks to James Waples for helpful discussions on protocol and API design.

@@ -1,37 +1,33 @@
 // TODO: Is there a nicer way for this default device impl without a macro? Need generics on modules
 // TODO: don't actually export this?
 #[macro_export]
-macro_rules! device_impl {
-    () => {
-        pub struct Device {
-            pub pdi_offset: usize,
-        }
+macro_rules! default_device_impl {
+    ($struct: ident, $command: ident, $status: ident) => {
+        impl crate::Device for $struct {
+            type Command = $command;
+            type Status = $status;
 
-        impl crate::Device for Device {
-            type Status = Status;
-            type Command = Command;
-
-            fn status(&self, pdi: &[u8]) -> Status {
-                postcard::from_bytes(&pdi[self.pdi_offset..(self.pdi_offset + PDI_WINDOW_SIZE)])
-                    .unwrap()
+            fn pdi_window_size(&self) -> usize {
+                core::cmp::max(
+                    Option::<Self::Command>::POSTCARD_MAX_SIZE,
+                    Self::Status::POSTCARD_MAX_SIZE,
+                )
             }
 
-            fn command(&self, pdi: &mut [u8], cmd: Option<&Command>) {
-                postcard::to_slice(
-                    &cmd,
-                    &mut pdi[self.pdi_offset..(self.pdi_offset + PDI_WINDOW_SIZE)],
-                )
-                .unwrap();
+            fn status(&self, pdi_window: &[u8]) -> Self::Status {
+                postcard::from_bytes(&pdi_window).unwrap()
+            }
+
+            fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command) {
+                postcard::to_slice(&Some(cmd), pdi_window).unwrap();
             }
         }
     };
 }
-
 pub mod led {
     pub use postcard;
     use postcard::experimental::max_size::MaxSize;
     use serde::{Deserialize, Serialize};
-    pub const PDI_WINDOW_SIZE: usize = Option::<Light>::POSTCARD_MAX_SIZE;
 
     #[cfg(feature = "eui")]
     use eui::*;
@@ -51,8 +47,24 @@ pub mod led {
         pub b: u8,
     }
 
-    pub type Command = Light;
-    pub type Status = Light;
+    pub struct Led {}
 
-    crate::device_impl!();
+    pub const PDI_WINDOW_SIZE: usize = Option::<Light>::POSTCARD_MAX_SIZE;
+
+    impl crate::Device for Led {
+        type Command = Light;
+        type Status = Light;
+
+        fn pdi_window_size(&self) -> usize {
+            PDI_WINDOW_SIZE
+        }
+
+        fn status(&self, pdi_window: &[u8]) -> Self::Status {
+            postcard::from_bytes(&pdi_window).unwrap()
+        }
+
+        fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command) {
+            postcard::to_slice(&Some(cmd), pdi_window).unwrap();
+        }
+    }
 }

@@ -14,13 +14,15 @@ pub trait Device {
     type Command;
     type Status;
 
-    fn status(&self, pdi: &[u8]) -> Self::Status;
-    fn command(&self, pdi: &mut [u8], cmd: Option<&Self::Command>);
+    fn pdi_window_size(&self) -> usize;
+    fn status(&self, pdi_window: &[u8]) -> Self::Status;
+    fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command);
 }
 
 use core::mem::size_of;
 
 pub use const_str::concat_bytes;
+use embedded_io_async::{Read, ReadExactError, Write};
 pub use heapless::String;
 use log::*;
 use serde::{Deserialize, Serialize};
@@ -43,7 +45,7 @@ impl DeviceAddress {
         DeviceAddress(u16::from_le_bytes(bytes))
     }
     pub fn to_wire_address(&self) -> i16 {
-        self.0 as i16
+        -(self.0 as i16)
     }
 }
 
@@ -120,6 +122,8 @@ pub const PRE_PAYLOAD_BYTE_COUNT: usize =
     size_of::<MessageType>() + size_of::<DeviceOrGroupAddressOnWire>() + size_of::<PayloadLength>();
 pub const CRC_BYTE_COUNT: usize = 4;
 
+pub const FRAME_SIZE_INITIALIZE: usize = PRE_PAYLOAD_BYTE_COUNT + 2 + 2 + CRC_BYTE_COUNT;
+
 pub const PING_FRAME: &[u8] =
     concat_bytes!(PING_FRAME_BASE, CRC.checksum(PING_FRAME_BASE).to_le_bytes());
 
@@ -162,49 +166,178 @@ pub fn frame(t: MessageType, address: DeviceOrGroupAddressOnWire, payload: &[u8]
     v
 }
 
-#[cfg(feature = "std")]
-pub fn initialize_frame(
-    device_address: DeviceAddress,
-    group_address: GroupAddress,
-    pdi_offset: PDIOffset,
-) -> Vec<u8> {
-    let mut payload = vec![];
+struct CRCWriter<W> {
+    writer: W,
+    digest: crc::Digest<'static, u32>,
+}
 
-    payload.extend_from_slice(&group_address.0.to_le_bytes());
-    payload.extend_from_slice(&pdi_offset.0.to_le_bytes());
+impl<W: Write> embedded_io::ErrorType for CRCWriter<W> {
+    type Error = W::Error;
+}
 
-    let address = -(device_address.0 as i16);
+impl<W: Write> CRCWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            digest: CRC.digest(),
+        }
+    }
+    pub async fn write_crc(
+        mut self,
+    ) -> Result<(), <CRCWriter<W> as embedded_io::ErrorType>::Error> {
+        self.writer
+            .write_all(&self.digest.finalize().to_le_bytes())
+            .await?;
+        Ok(())
+    }
+}
 
-    let mut v = vec![0; MAX_FRAME_SIZE];
-    let len = write_frame(&mut v[..], MessageType::Initialize, address, &payload[..]).len();
-    v.truncate(len);
-    v
+impl<W: Write> Write for CRCWriter<W> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        let n = self.writer.write(buf).await?;
+        self.digest.update(&buf[0..n]);
+        Ok(n)
+    }
+}
+
+#[derive(Debug)]
+pub enum CRCReaderError<E> {
+    CRC,
+    IO(E),
+}
+
+impl<E: core::fmt::Debug> embedded_io_async::Error for CRCReaderError<E> {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        embedded_io::ErrorKind::InvalidData
+    }
+}
+
+struct CRCReader<R> {
+    reader: R,
+    digest: crc::Digest<'static, u32>,
+}
+
+impl<R: Read> embedded_io::ErrorType for CRCReader<R> {
+    type Error = CRCReaderError<R::Error>;
+}
+
+impl<R: Read> CRCReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            digest: CRC.digest(),
+        }
+    }
+    pub async fn read_crc(mut self) -> Result<(), Error> {
+        let mut buf = [0u8; CRC_BYTE_COUNT];
+        self.reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(ReadExactErrorWrapper::from)?;
+
+        if buf == self.digest.finalize().to_le_bytes() {
+            Ok(())
+        } else {
+            // TODO: better error?
+            //Error::IO(embedded_io_async::ErrorKind::InvalidData)
+            Err(Error::CRC)
+        }
+    }
+}
+
+impl<R: Read> Read for CRCReader<R> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let n = self.reader.read(buf).await.map_err(CRCReaderError::IO)?;
+        self.digest.update(&buf[0..n]);
+        Ok(n)
+    }
+}
+
+pub async fn write_frame2<W: Write>(
+    writer: W,
+    message_type: MessageType,
+    address: DeviceOrGroupAddressOnWire,
+    payload: &[u8],
+) -> Result<(), Error> {
+    let mut w = CRCWriter::new(writer);
+    w.write(&[message_type as u8]).await?;
+    w.write(&address.to_le_bytes()).await?;
+    w.write(&(payload.len() as PayloadLength).to_le_bytes())
+        .await?;
+    w.write(payload).await?;
+    w.write_crc().await?;
+    Ok(())
 }
 
 use bbqueue::Producer;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+//////////////////
+//TODO: is there a proper way to do this error stuff?
+
+//use thiserror::Error;
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
+    UnexpectedResponse,
+
+    //#[error("{0:?}")]
+    IO(embedded_io_async::ErrorKind),
+
     TODO,
-    RX,
     CRC,
     BadMessageType,
+    PDILengthMismatch,
 }
+
+pub struct ReadExactErrorWrapper<E>(pub ReadExactError<E>);
+
+impl<E: embedded_io_async::Error> From<ReadExactError<E>> for ReadExactErrorWrapper<E> {
+    fn from(error: ReadExactError<E>) -> Self {
+        ReadExactErrorWrapper(error)
+    }
+}
+impl<E: embedded_io_async::Error> From<ReadExactErrorWrapper<E>> for Error {
+    fn from(wrapper: ReadExactErrorWrapper<E>) -> Self {
+        match wrapper.0 {
+            ReadExactError::UnexpectedEof => Error::UnexpectedResponse,
+            ReadExactError::Other(e) => Error::IO(e.kind()),
+        }
+    }
+}
+
+impl<E: embedded_io_async::Error> From<E> for Error {
+    fn from(e: E) -> Self {
+        Error::IO(e.kind())
+    }
+}
+
+// impl embedded_io_async::Error for Error {
+//     fn kind(&self) -> embedded_io::ErrorKind {
+//         match self {
+//             Error::UnexpectedResponse => embedded_io_async::ErrorKind::InvalidData,
+//             Error::IO(e) => e.kind(),
+//             Error::TODO => embedded_io_async::ErrorKind::Other,
+//             Error::CRC => embedded_io_async::ErrorKind::InvalidData,
+//             Error::BadMessageType => embedded_io_async::ErrorKind::InvalidData,
+//         }
+//     }
+// }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Action<const PDI_WINDOW_SIZE: usize> {
+pub enum Action<'out> {
     NewState(DeviceState),
     // TODO: should this be a reference rather than allocated on the stack?
-    NewCommand([u8; PDI_WINDOW_SIZE]),
+    NewCommand(&'out [u8]),
 }
 
-pub async fn handle_frame<R, const N: usize, const PDI_WINDOW_SIZE: usize>(
+pub async fn handle_frame<'out, R, const N: usize>(
     state: DeviceState,
-    latest_status: &[u8; PDI_WINDOW_SIZE],
+    latest_status: &[u8],
+    command_buf: &'out mut [u8],
     mut rx: R,
     bbq: &mut Producer<'_, N>,
     data_available: impl Fn(),
-) -> Result<Option<Action<PDI_WINDOW_SIZE>>, Error>
+) -> Result<Option<Action<'out>>, Error>
 where
     R: embedded_io_async::Read,
 {
@@ -247,7 +380,7 @@ where
         ($buf: expr) => {
             if let Err(e) = embedded_io_async::Read::read_exact(&mut rx, $buf).await {
                 error!("Upstream RX Error: {:?}", e);
-                return Err(Error::RX);
+                return Err(ReadExactErrorWrapper::from(e).into());
             }
         };
     }
@@ -264,7 +397,7 @@ where
             match embedded_io_async::Read::read(&mut rx, $buf).await {
                 Err(e) => {
                     error!("Upstream RX Error: {:?}", e);
-                    return Err(Error::RX);
+                    return Err(e.into());
                 }
                 Ok(n) => n,
             }
@@ -363,19 +496,18 @@ where
                 ) if group_address == (*address as i16) => {
                     debug!("Handling ProcessUpdate");
 
-                    if payload_length < (pdi_offset.0 + PDI_WINDOW_SIZE as u16) {
-                        error!("process update payload length smaller than pdi_offset + PDI_WINDOW_SIZE");
+                    if payload_length < (pdi_offset.0 + command_buf.len() as u16) {
+                        error!("process update payload length smaller than pdi_offset + pdi_window_size");
                         return Err(Error::TODO);
                     }
                     forward!(pdi_offset.0 as usize);
 
                     write!(latest_status);
 
-                    let mut buf = [0u8; PDI_WINDOW_SIZE];
-                    read_exact!(&mut buf[..]);
-                    debug!("process update read: {buf:?}");
+                    read_exact!(command_buf);
+                    debug!("process update read: {command_buf:?}");
 
-                    Some(Action::NewCommand(buf))
+                    Some(Action::NewCommand(command_buf))
                 }
 
                 (Initialize | Identify | Query | ProcessUpdate, _, _) => {
@@ -442,38 +574,6 @@ mod test {
         assert_eq!(PING_FRAME_BASE.len(), PRE_PAYLOAD_BYTE_COUNT);
     }
 
-    fn test_parse(state: DeviceState, frame: &[u8]) -> (Result<Option<Action<1>>, Error>, Vec<u8>) {
-        smol::block_on(async move {
-            let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
-            let (mut producer, mut consumer) = bbq.try_split().unwrap();
-
-            let latest_status = [7u8];
-
-            let result = handle_frame(state, &latest_status, frame, &mut producer, || {}).await;
-
-            let mut downstream = vec![];
-            while let Ok(g) = consumer.read() {
-                let buf = g.buf();
-                let n = buf.len();
-                downstream.extend_from_slice(&buf);
-                g.release(n);
-            }
-
-            (result, downstream)
-        })
-    }
-
-    #[test]
-    fn integration() {
-        assert_eq!(
-            test_parse(
-                DeviceState::Reset,
-                &frame(MessageType::Enumerate, 0, &[])[..],
-            ),
-            (Ok(None), frame(MessageType::Enumerate, 1, &[]),)
-        );
-    }
-
     use embedded_io_async::{Read, Write};
     use smol::channel::{self, Receiver, Sender};
 
@@ -523,22 +623,25 @@ mod test {
     trait MockPort: Read<Error = MockError> + Write<Error = MockError> {}
     impl MockPort for MockSerial {}
 
-    async fn device<const PDI_WINDOW_SIZE: usize>(
+    async fn device(
         mut port: impl MockPort,
-        cb: fn(status: &mut [u8], cmd: [u8; PDI_WINDOW_SIZE]),
+        pdi_window_size: usize,
+        cb: fn(status: &mut [u8], cmd: &[u8]),
     ) {
         let bbq = bbqueue::BBBuffer::<{ 1024 * 8 }>::new();
         let (mut producer, mut consumer) = bbq.try_split().unwrap();
 
         let mut state = DeviceState::Reset;
+
         // TODO: how should device initialize default status?
         // should there be rust protocol around this, or is it just up to device firmware implementors?
-        let mut latest_status = [0u8; PDI_WINDOW_SIZE];
-
+        let mut latest_status = vec![0u8; pdi_window_size];
+        let mut command_buf = vec![0u8; pdi_window_size];
         loop {
             let result = handle_frame(
                 state.clone(),
                 &latest_status,
+                &mut command_buf,
                 &mut port,
                 &mut producer,
                 || {},
@@ -558,10 +661,9 @@ mod test {
                     Action::NewState(s) => state = s,
                     Action::NewCommand(cmd) => cb(&mut latest_status[..], cmd),
                 },
-                Err(Error::RX) => {
-                    return;
-                }
-
+                // Err(Error::IO(_)) => {
+                //     return;
+                // }
                 Err(e) => {
                     error!("Unexpected device error: {e:?}");
                     return;
@@ -571,103 +673,60 @@ mod test {
     }
 
     async fn controller(mut port: impl MockPort) {
-        let mut buf_res = vec![0; MAX_FRAME_SIZE];
+        let mut buf = [0; MAX_FRAME_SIZE];
 
         use controller::*;
 
         use test::devices::{counter, echoer};
 
-        setup_network!(PDI_OFFSETS, (c1, counter), (e1, echoer));
+        // TODO: fancy types to zero-cost prevent devices from being used between different Networks?
 
-        let mut buf_cmd = vec![0; PDI_SIZE];
+        // TODO: how can I avoid needing to annotate NUM_GROUPS = 1 in constructor here?
+        let mut network = Network::<_, 1>::new(&mut port);
 
-        // TODO: make this part of network macro? That would require it to allocate a PDI_SIZE'd buffer rather than letting caller do it.
-        // alternatively, generate a closure to populate a buffer?
-        c1.command(&mut buf_cmd, None);
-        e1.command(&mut buf_cmd, None);
+        // Devices must be added in physical daisy-chain order
+        let c1 = network.add(counter::Counter {}).await.unwrap();
+        let e1 = network.add(echoer::Echoer {}).await.unwrap();
 
         ///////////////////
         // Enumerate
-        {
-            port.write(&frame(MessageType::Enumerate, 0, &[])[..])
-                .await
-                .unwrap();
+        // {
+        //     port.write(&frame(MessageType::Enumerate, 0, &[])[..])
+        //         .await
+        //         .unwrap();
 
-            wait_for(
-                &mut port,
-                &frame(MessageType::Enumerate, NUM_DEVICES as i16, &[])[..],
-            )
-            .await
-            .unwrap();
-        }
-
-        ///////////////////
-        // Initialize
-
-        let group_address = GroupAddress(7);
-
-        for (idx, offset) in PDI_OFFSETS.iter().enumerate() {
-            port.write(&initialize_frame(
-                DeviceAddress((idx + 1) as u16),
-                group_address,
-                PDIOffset(*offset as u16),
-            ))
-            .await
-            .unwrap();
-
-            let _f = controller::try_parse_frame(&mut port, &mut buf_res)
-                .await
-                .unwrap();
-        }
+        //     wait_for(
+        //         &mut port,
+        //         &frame(MessageType::Enumerate, network.num_devices() as i16, &[])[..],
+        //     )
+        //     .await
+        //     .unwrap();
+        // }
 
         ///////////////////
         // Process Update 1
 
-        c1.command(&mut buf_cmd, Some(&counter::Command::Increment));
-        e1.command(&mut buf_cmd, Some(&echoer::Command::SetValue(17)));
+        let mut pdi = network.pdi(&mut buf);
 
-        port.write(
-            &frame(
-                MessageType::ProcessUpdate,
-                group_address.to_wire_address(),
-                &buf_cmd,
-            )[..],
-        )
-        .await
-        .unwrap();
+        assert_eq!(pdi.buf.len(), c1.pdi_window().len() + e1.pdi_window().len());
 
-        let f = controller::try_parse_frame(&mut port, &mut buf_res)
-            .await
-            .unwrap();
+        pdi.command(&c1, &counter::Command::Increment);
+        pdi.command(&e1, &echoer::Command::SetValue(17));
+        let pdi = network.cycle(pdi).await.unwrap();
 
         // Even though we sent commands, the statuses returned will be those before those commands were processed by the devices.
-        assert!(matches!(c1.status(f.payload), counter::Status::Value(0)));
-        assert!(matches!(e1.status(f.payload), echoer::Status::NoValueSet));
+        assert!(matches!(pdi.status(&c1), counter::Status::Value(0)));
+        assert!(matches!(pdi.status(&e1), echoer::Status::NoValueSet));
 
         ///////////////////
         // Process Update 2
-
-        c1.command(&mut buf_cmd, None);
-        e1.command(&mut buf_cmd, None);
-
-        port.write(
-            &frame(
-                MessageType::ProcessUpdate,
-                group_address.to_wire_address(),
-                &buf_cmd,
-            )[..],
-        )
-        .await
-        .unwrap();
-
-        let f = controller::try_parse_frame(&mut port, &mut buf_res)
-            .await
-            .unwrap();
+        let pdi = pdi.reset();
+        let pdi = network.cycle(pdi).await.unwrap();
 
         // TODO: how to improve tests here? When `matches!` fails it doesn't say what the actual value was.
         // Now we expect the results from Process Update 1 to be reported.
-        assert!(matches!(c1.status(f.payload), counter::Status::Value(1)));
-        assert!(matches!(e1.status(f.payload), echoer::Status::ValueSet(17)));
+        assert!(matches!(pdi.status(&c1), counter::Status::Value(1)));
+        assert!(matches!(pdi.status(&e1), echoer::Status::ValueSet(17)));
     }
 
     #[test]
@@ -695,7 +754,8 @@ mod test {
                     reader: rx1,
                     writer: tx2,
                 },
-                |status, cmd: [u8; counter::PDI_WINDOW_SIZE]| {
+                (counter::Counter {}).pdi_window_size(),
+                |status, cmd: &[u8]| {
                     if let Some(cmd) =
                         postcard::from_bytes::<Option<counter::Command>>(&cmd).unwrap()
                     {
@@ -714,7 +774,8 @@ mod test {
                     reader: rx2,
                     writer: tx3,
                 },
-                |status, cmd: [u8; echoer::PDI_WINDOW_SIZE]| {
+                (echoer::Echoer {}).pdi_window_size(),
+                |status, cmd: &[u8]| {
                     if let Some(cmd) =
                         postcard::from_bytes::<Option<echoer::Command>>(&cmd).unwrap()
                     {
@@ -743,15 +804,6 @@ mod test {
             use postcard::experimental::max_size::MaxSize;
             use serde::{Deserialize, Serialize};
 
-            // TODO:
-            // const fn max(a: usize, b: usize) -> usize {
-            //     [a, b][(a < b) as usize]
-            // }
-
-            // TODO: core::cmp::max isn't max, so just waste a bunch of bytes. Ugh, Rust.
-            pub const PDI_WINDOW_SIZE: usize =
-                Option::<Command>::POSTCARD_MAX_SIZE + Status::POSTCARD_MAX_SIZE;
-
             #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
             pub enum Command {
                 SetValue(u8),
@@ -763,15 +815,13 @@ mod test {
                 ValueSet(u8),
             }
 
-            crate::device_impl!();
+            pub struct Echoer {}
+            crate::default_device_impl!(Echoer, Command, Status);
         }
 
         pub mod counter {
             use postcard::experimental::max_size::MaxSize;
             use serde::{Deserialize, Serialize};
-
-            pub const PDI_WINDOW_SIZE: usize =
-                Option::<Command>::POSTCARD_MAX_SIZE + Status::POSTCARD_MAX_SIZE;
 
             #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
             pub enum Command {
@@ -781,8 +831,8 @@ mod test {
             pub enum Status {
                 Value(u8),
             }
-
-            crate::device_impl!();
+            pub struct Counter {}
+            crate::default_device_impl!(Counter, Command, Status);
         }
     }
 }

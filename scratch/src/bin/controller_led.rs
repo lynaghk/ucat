@@ -38,8 +38,7 @@ impl Write for Port {
 
 use eui::*;
 
-use ucat::device::led;
-use ucat::device::led::{Color, Light};
+use ucat::device::led::{Color, Led, Light};
 
 pub fn main() -> anyhow::Result<()> {
     #[eui]
@@ -56,7 +55,7 @@ pub fn main() -> anyhow::Result<()> {
     impl Command for C {}
 
     let (cmd_tx, mut cmd_rx) = channel::<C>(64);
-    let (status_tx, status_rx) = channel::<Foo>(64);
+    let (_status_tx, status_rx) = channel::<Foo>(64);
 
     std::thread::spawn(|| {
         serve_blocking("127.0.0.1:8080", status_rx, cmd_tx);
@@ -71,120 +70,43 @@ pub fn main() -> anyhow::Result<()> {
         port.0
             .set_timeout(std::time::Duration::from_millis(1000000000000))?;
 
-        let mut incoming = vec![0; MAX_FRAME_SIZE];
-
-        setup_network!(PDI_OFFSETS, (l1, led));
-
-        let mut buf_cmd = vec![0; PDI_SIZE];
-
-        l1.command(&mut buf_cmd, None);
-
         ///////////////////
         // Wait for ping
 
-        //let _ = wait_for_init_frame(&mut port).await.unwrap();
+        //let _ = wait_for_ping_frame(&mut port).await.unwrap();
 
-        ///////////////////
-        // Enumerate
-        {
-            port.write_all(&frame(MessageType::Enumerate, 0, &[])[..])
-                .await
-                .unwrap();
+        let mut buf = [0u8; MAX_FRAME_SIZE];
+        let mut network = Network::<_, 1>::new(&mut port);
 
-            wait_for(
-                &mut port,
-                &frame(MessageType::Enumerate, NUM_DEVICES as i16, &[])[..],
-            )
-            .await
-            .unwrap();
-        }
-
-        ///////////////////
-        // Initialize
-
-        let group_address = GroupAddress(7);
-
-        for (idx, offset) in PDI_OFFSETS.iter().enumerate() {
-            port.write_all(&initialize_frame(
-                DeviceAddress((idx + 1) as u16),
-                group_address,
-                PDIOffset(*offset as u16),
-            ))
-            .await
-            .unwrap();
-
-            let _f = controller::try_parse_frame(&mut port, &mut incoming)
-                .await
-                .unwrap();
-        }
+        let l1 = network.add(Led {}).await.unwrap();
 
         ///////////////////
         // Process Update 1
-        {
-            //l1.command(&mut buf_cmd, Some(&Light::On(Color { r: 10, g: 0, b: 10 })));
-            l1.command(&mut buf_cmd, Some(&Light::Off));
-
-            port.write_all(
-                &frame(
-                    MessageType::ProcessUpdate,
-                    group_address.to_wire_address(),
-                    &buf_cmd,
-                )[..],
-            )
-            .await
-            .unwrap();
-
-            let f = controller::try_parse_frame(&mut port, &mut incoming)
-                .await
-                .unwrap();
-
-            dbg!(l1.status(f.payload));
-        }
+        let mut pdi = network.pdi(&mut buf);
+        pdi.command(&l1, &Light::Off);
+        let pdi = network.cycle(pdi).await.unwrap();
+        dbg!(pdi.status(&l1));
 
         ///////////////////
         // Process Update 2
-        {
-            //l1.command(&mut buf_cmd, None);
-            l1.command(&mut buf_cmd, Some(&Light::On(Color { r: 10, g: 0, b: 10 })));
-            port.write_all(
-                &frame(
-                    MessageType::ProcessUpdate,
-                    group_address.to_wire_address(),
-                    &buf_cmd,
-                )[..],
-            )
-            .await
-            .unwrap();
+        let mut pdi = pdi.reset();
+        pdi.command(&l1, &Light::On(Color { r: 10, g: 0, b: 10 }));
+        let pdi = network.cycle(pdi).await.unwrap();
+        dbg!(pdi.status(&l1));
 
-            let f = controller::try_parse_frame(&mut port, &mut incoming)
-                .await
-                .unwrap();
+        ///////////////////
+        // Loop
 
-            dbg!(l1.status(f.payload));
-        }
+        let mut pdi = pdi.reset();
 
         loop {
             // let n = port.read(&mut incoming[..]).await.unwrap();
             // info!("{:?}", &incoming[0..n]);
 
             while let Ok(c) = cmd_rx.try_recv() {
-                l1.command(&mut buf_cmd, Some(&c.a));
-                port.write_all(
-                    &frame(
-                        MessageType::ProcessUpdate,
-                        group_address.to_wire_address(),
-                        &buf_cmd,
-                    )[..],
-                )
-                .await
-                .unwrap();
-
-                let f = controller::try_parse_frame(&mut port, &mut incoming)
-                    .await
-                    .unwrap();
+                pdi.command(&l1, &c.a);
+                pdi = network.cycle(pdi).await.unwrap().reset();
             }
         }
-
-        Ok(())
     })
 }

@@ -7,38 +7,28 @@ edition = "2021"
 [dependencies]
 ucat = { path = "../../", default-features = false }
 
-esp32s3-hal = { version = "0.14", features = [] }
-esp-hal-common = { version = "0.14", features = ["async", "esp32s3", "embassy", "embassy-executor-thread", "embassy-time-timg0"] }
-
-esp-backtrace = { version = "0.10.0", features = ["esp32s3", "panic-handler", "exception-handler", "print-uart"] }
-esp-println = { version = "0.8.0", features = ["esp32s3", "log"] }
 log = { version = "0.4" }
+
+esp32s3-hal = { version = "0.15", features = ["async", "log", "embassy", "embassy-executor-thread", "embassy-time-timg0"] }
+esp-backtrace = { version = "0.10", features = ["esp32s3", "panic-handler", "exception-handler", "print-uart"] }
+esp-println = { version = "0.8", features = ["esp32s3", "log"] }
 esp-hal-smartled = { version = "*", features = ["esp32s3"] }
-smart-leds = "0.3"
 
-embassy-time = { version = "0.3" }
-embassy-executor   = { version = "0.5.0", features = ["nightly"] }
-embedded-hal = "1"
-#embedded-hal-1 = { version = "1.0", package = "embedded-hal" }
+embedded-hal       = "1"
 embedded-hal-async = "1.0.0"
-embedded-io-async  = "0.6.1"
-embassy-sync       = "0.5.0"
+embedded-io-async  = "0.6"
 
+embassy-executor   = { version = "0.5", features = ["nightly"] }
+embassy-time = { version = "0.3" }
+embassy-sync       = "0.5"
+
+smart-leds = "0.4"
+bbqueue = "0.5"
+futures = { version = "0.3", default-features = false }
 static_cell = { version = "2.0.0", features = ["nightly"] }
-bbqueue = "0.5.1"
-crc = "3.0.1"
-futures = { version = "0.3.30", default-features = false }
+
 
 [features]
-#embassy-integrated-timers
-
-
-[patch.crates-io]
-
-# pending https://github.com/esp-rs/esp-hal/issues/1075
-esp32s3-hal     = { git = "https://github.com/Sycrosity/esp-hal/" }
-esp-hal-common     = { git = "https://github.com/Sycrosity/esp-hal/" }
-
 
 [profile.release]
 debug = false

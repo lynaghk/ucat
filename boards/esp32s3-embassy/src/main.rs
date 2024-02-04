@@ -6,25 +6,31 @@
 use bbqueue::{BBBuffer, Consumer, Producer};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
-use esp32s3_hal::{clock::ClockControl, embassy, peripherals::Peripherals, prelude::*, Rmt, IO};
-use esp_backtrace as _;
-use esp_hal_common::{
+
+use esp32s3_hal::{
+    clock::ClockControl,
+    embassy,
     gpio::{GpioPin, Unknown},
-    peripherals::{UART1, UART2},
-    Uart, UartRx, UartTx,
+    peripherals::{Peripherals, UART1, UART2},
+    prelude::*,
+    Rmt, Uart, UartRx, UartTx, IO,
 };
+use esp_backtrace as _;
+
 use futures::future::FutureExt;
 use log::*;
+
+use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
 use smart_leds::SmartLedsWrite;
+
 use static_cell::make_static;
 
-use ucat::{device::led::Light, *};
+use ucat::*;
 
 // TODO: seems to be brutal to try and create generic tasks: https://github.com/embassy-rs/embassy/issues/1837
 // if I need to share RMT across tasks, may be best to just Peripherals::steal() ...
 #[embassy_executor::task]
 async fn led(rmt: Rmt<'static>, pin: GpioPin<Unknown, 38>) {
-    use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
     use smart_leds::{
         brightness, gamma,
         hsv::{hsv2rgb, Hsv},
@@ -100,8 +106,7 @@ async fn upstream_reader(
 
     let mut led = {
         let ch = rmt.channel0;
-        let mut led =
-            esp_hal_smartled::SmartLedsAdapter::new(ch, pin, esp_hal_smartled::smartLedBuffer!(1));
+        let mut led = SmartLedsAdapter::new(ch, pin, smartLedBuffer!(1));
         move |l: &Light, latest_status: &mut [u8]| {
             use smart_leds::RGB8;
             let c = match l {
@@ -239,14 +244,14 @@ async fn main(spawner: embassy_executor::Spawner) {
     let clocks = ClockControl::max(system.clock_control).freeze();
 
     let timer_group0 = esp32s3_hal::timer::TimerGroup::new(peripherals.TIMG0, &clocks);
-    embassy::init(&clocks, timer_group0.timer0);
+    embassy::init(&clocks, timer_group0);
 
     let boot_delay = Timer::after(Duration::from_millis(40));
 
     // UART
 
     let (upstream_uart, downstream_uart) = {
-        use esp_hal_common::uart::{config::*, TxRxPins};
+        use esp32s3_hal::uart::{config::*, TxRxPins};
         let config = Config {
             baudrate: 115200,
             data_bits: DataBits::DataBits8,

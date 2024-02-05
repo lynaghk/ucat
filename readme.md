@@ -22,11 +22,15 @@ espup install --targets esp32s3,esp32c3
 - control LEDs on three esp32s3 via eui
 - device latency test / protocol
 
+## Open questions
+
+- dynamic UART baud rate? PING message could contain downstream device's max supported speed. Would need ack from upstream device. Probably too complicated.
+
 ## Notes
 
-to generate cargo demo project
+to generate cargo demo project:
 
-cargo generate esp-rs/esp-idf-template cargo
+    cargo generate esp-rs/esp-idf-template cargo
 
 rust-analyzer must be installed *without* rustup, otherwise there will be toolchain errors.
 
@@ -254,7 +258,7 @@ Also looked into stm32 "passthrough" DMA --- seems like it'll be tricker than I 
 
 
 ## Lessons / changes 
-Started with PDI_WINDOW_SIZE as const, but made dynamic to support runtime configuration. Rust consts too annoying to shuffle around everywhere.
+- Started with PDI_WINDOW_SIZE as const, but made dynamic to support runtime configuration. Rust consts too annoying to shuffle around everywhere.
 
 
 ## Thanks

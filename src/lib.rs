@@ -2,10 +2,23 @@
 #![feature(error_in_core)]
 
 pub mod controller;
-
 pub mod device;
+mod util;
+
+pub use const_str::concat_bytes;
+use core::mem::size_of;
+
+use embedded_io_async::{Read, ReadExactError, Write};
+pub use heapless::String;
+use log::*;
+use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME_SIZE: usize = 2048;
+
+/// Devices should be ready to send/receive frames by this time after reset.
+pub const STARTUP_DELAY_MILLIS: usize = 200;
+
+pub const BAUD_RATE: usize = 115_200;
 
 pub type Digest = crc::Digest<'static, u32>;
 pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
@@ -18,14 +31,6 @@ pub trait Device {
     fn status(&self, pdi_window: &[u8]) -> Self::Status;
     fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command);
 }
-
-use core::mem::size_of;
-
-pub use const_str::concat_bytes;
-use embedded_io_async::{Read, ReadExactError, Write};
-pub use heapless::String;
-use log::*;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Frame<'a> {

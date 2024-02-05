@@ -24,13 +24,13 @@ macro_rules! default_device_impl {
         }
     };
 }
+
 pub mod led {
     pub use postcard;
     use postcard::experimental::max_size::MaxSize;
     use serde::{Deserialize, Serialize};
 
-    #[cfg(feature = "eui")]
-    use eui::*;
+    pub struct Led {}
 
     #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
     #[cfg_attr(feature = "eui", derive(eui::eui_derive::Schema))]
@@ -47,13 +47,49 @@ pub mod led {
         pub b: u8,
     }
 
-    pub struct Led {}
-
     pub const PDI_WINDOW_SIZE: usize = Option::<Light>::POSTCARD_MAX_SIZE;
 
     impl crate::Device for Led {
         type Command = Light;
         type Status = Light;
+
+        fn pdi_window_size(&self) -> usize {
+            PDI_WINDOW_SIZE
+        }
+
+        fn status(&self, pdi_window: &[u8]) -> Self::Status {
+            postcard::from_bytes(&pdi_window).unwrap()
+        }
+
+        fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command) {
+            postcard::to_slice(&Some(cmd), pdi_window).unwrap();
+        }
+    }
+}
+
+pub mod temp_sensor {
+    pub use postcard;
+    use postcard::experimental::max_size::MaxSize;
+    use serde::{Deserialize, Serialize};
+
+    pub struct TempSensor {}
+
+    #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+    #[cfg_attr(feature = "eui", derive(eui::eui_derive::Schema))]
+    pub enum Command {}
+
+    #[derive(Debug, Clone, Serialize, Deserialize, MaxSize)]
+    #[cfg_attr(feature = "eui", derive(eui::eui_derive::Schema))]
+    pub struct TempCelcius(pub f32);
+
+    pub const PDI_WINDOW_SIZE: usize = crate::util::max(
+        Option::<Command>::POSTCARD_MAX_SIZE,
+        Option::<TempCelcius>::POSTCARD_MAX_SIZE,
+    );
+
+    impl crate::Device for TempSensor {
+        type Command = Command;
+        type Status = TempCelcius;
 
         fn pdi_window_size(&self) -> usize {
             PDI_WINDOW_SIZE

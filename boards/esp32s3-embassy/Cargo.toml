@@ -29,6 +29,9 @@ static_cell = { version = "2.0.0", features = ["nightly"] }
 
 
 [features]
+default = ["temp-sensor"]
+led = []
+temp-sensor = []
 
 [profile.release]
 debug = false

@@ -1,70 +1,24 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
-#![allow(non_camel_case_types)]
 
 use bbqueue::{BBBuffer, Consumer, Producer};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
-
 use esp32s3_hal::{
     clock::ClockControl,
     embassy,
-    gpio::{GpioPin, Unknown},
     peripherals::{Peripherals, UART1, UART2},
     prelude::*,
-    Rmt, Uart, UartRx, UartTx, IO,
+    Uart, UartRx, UartTx, IO,
 };
 use esp_backtrace as _;
+use esp_println::dbg;
 
 use futures::future::FutureExt;
 use log::*;
-
-use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
-use smart_leds::SmartLedsWrite;
-
 use static_cell::make_static;
-
 use ucat::*;
-
-// TODO: seems to be brutal to try and create generic tasks: https://github.com/embassy-rs/embassy/issues/1837
-// if I need to share RMT across tasks, may be best to just Peripherals::steal() ...
-#[embassy_executor::task]
-async fn led(rmt: Rmt<'static>, pin: GpioPin<Unknown, 38>) {
-    use smart_leds::{
-        brightness, gamma,
-        hsv::{hsv2rgb, Hsv},
-        SmartLedsWrite,
-    };
-
-    // let peripherals = Peripherals::steal();
-    // let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-
-    let ch = rmt.channel0;
-    let mut led = SmartLedsAdapter::new(ch, pin, smartLedBuffer!(1));
-
-    loop {
-        let mut color = Hsv {
-            hue: 0,
-            sat: 255,
-            val: 255,
-        };
-
-        for hue in 0..=255 {
-            color.hue = hue;
-            // Convert from the HSV color space (where we can easily transition from one
-            // color to the other) to the RGB color space that we can then send to the LED
-            let data = [hsv2rgb(color)];
-            // When sending to the LED, we do a gamma correction first (see smart_leds
-            // documentation for details) and then limit the brightness to 10 out of 255 so
-            // that the output it's not too bright.
-            led.write(brightness(gamma(data.iter().cloned()), 10))
-                .unwrap();
-
-            Timer::after(Duration::from_millis(20)).await;
-        }
-    }
-}
 
 // Interrupt will be triggered after these many bytes.
 // FIFO buffers are 128 bytes by default. All three UART controllers on ESP32-S3 share 1024 × 8 bits of RAM. As Figure 26-3 illustrates, the RAM is divided into 8 blocks, each having 128 × 8 bits.
@@ -76,88 +30,75 @@ const BUFFER_SIZE: usize = ucat::MAX_FRAME_SIZE * 2;
 static UPSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
 static DOWNSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
 
-type UPSTREAM_UART = UART1;
-type DOWNSTREAM_UART = UART2;
+type UpstreamUart = UART1;
+type DownstreamUart = UART2;
 
 type QueueProducer = Producer<'static, BUFFER_SIZE>;
 type QueueConsumer = Consumer<'static, BUFFER_SIZE>;
 type DataAvailableSignal = &'static Signal<NoopRawMutex, ()>;
+type StatusSignal = &'static Signal<NoopRawMutex, Status>;
+type CommandSignal = &'static Signal<NoopRawMutex, Command>;
+type Status = <DeviceType as Device>::Status;
+type Command = <DeviceType as Device>::Command;
+
+// TODO: move this into shared schema crate, not ucat.
+#[cfg(feature = "led")]
+use ucat::device::led::{postcard, Color, Led as DeviceType, Light, PDI_WINDOW_SIZE};
+
+#[cfg(feature = "temp-sensor")]
+use ucat::device::temp_sensor::{postcard, TempCelcius, TempSensor as DeviceType, PDI_WINDOW_SIZE};
 
 #[embassy_executor::task]
 async fn upstream_reader(
-    mut rx: UartRx<'static, UPSTREAM_UART>,
+    mut rx: UartRx<'static, UpstreamUart>,
     mut downstream: QueueProducer,
     data_available: DataAvailableSignal,
-    // TODO: factor the actual LED logic. I tried passing in a closure here, but...rust.
-    rmt: Rmt<'static>,
-    pin: GpioPin<Unknown, 38>,
+    status: StatusSignal,
+    command: CommandSignal,
 ) {
-    // TODO: move this into shared schema crate, not ucat.
-    use ucat::device::led::{postcard, Color, Led, Light, PDI_WINDOW_SIZE};
-
-    type Status = <Led as Device>::Status;
-    type Command = <Led as Device>::Command;
-
     let mut state = DeviceState::Reset;
-    let mut latest_status = [0u8; PDI_WINDOW_SIZE];
+    let mut status_buf = [0u8; PDI_WINDOW_SIZE];
     let mut command_buf = [0u8; PDI_WINDOW_SIZE];
+    let mut last_status = status.wait().await;
 
     let data_available = || data_available.signal(());
-
-    let mut led = {
-        let ch = rmt.channel0;
-        let mut led = SmartLedsAdapter::new(ch, pin, smartLedBuffer!(1));
-        move |l: &Light, latest_status: &mut [u8]| {
-            use smart_leds::RGB8;
-            let c = match l {
-                device::led::Light::Off => RGB8 { r: 0, g: 0, b: 0 },
-                device::led::Light::On(Color { r, g, b }) => RGB8 {
-                    r: *r,
-                    g: *g,
-                    b: *b,
-                },
-            };
-            let _ = led.write([c].into_iter());
-            info!("cmd: {:?}", l);
-            let status: &Status = l;
-            postcard::to_slice(status, latest_status).unwrap();
-        }
-    };
-
-    // set initial status
-    led(&Light::On(Color { r: 0, g: 10, b: 0 }), &mut latest_status);
 
     // TODO: use rx idle timeout interrupt rather than embassy timeout here.
     let timeout = Duration::from_millis(500);
     loop {
+        // TODO: refactor so handle_frame can use most recent status buffer when it's writing out to PDI?
+        // Status gets "stale" while waiting for PDI.
+        if status.signaled() {
+            last_status = status.wait().await;
+        }
+        postcard::to_slice(&last_status, &mut status_buf).unwrap();
+
         let f = handle_frame(
             state.clone(),
-            &latest_status,
-            &mut command_buf[..],
+            &status_buf,
+            &mut command_buf,
             &mut rx,
             &mut downstream,
             data_available,
         );
 
-        match embassy_time::with_timeout(timeout, f).await {
-            Err(_) => {
-                error!("Timed out waiting for message");
-                continue;
-            }
-            Ok(result) => match result {
-                Ok(None) => {}
-                Ok(Some(action)) => match action {
-                    Action::NewState(s) => state = s,
-                    Action::NewCommand(cmd) => {
-                        if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
-                            led(&cmd, &mut latest_status);
-                        }
-                    }
-                },
+        let Ok(result) = embassy_time::with_timeout(timeout, f).await else {
+            error!("Timed out waiting for message");
+            continue;
+        };
 
-                Err(e) => {
-                    error!("Unexpected device error: {e:?}");
-                    return;
+        match result {
+            Err(e) => {
+                error!("Unexpected device error: {e:?}");
+                return;
+            }
+            Ok(None) => {}
+            Ok(Some(action)) => match action {
+                Action::NewState(s) => state = s,
+                Action::NewCommand(cmd) => {
+                    if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
+                        command.signal(cmd)
+                    }
                 }
             },
         }
@@ -166,7 +107,7 @@ async fn upstream_reader(
 
 #[embassy_executor::task]
 async fn downstream_writer(
-    _tx: UartTx<'static, DOWNSTREAM_UART>,
+    _tx: UartTx<'static, DownstreamUart>,
     mut _consumer: QueueConsumer,
     _data_available: DataAvailableSignal,
 ) {
@@ -175,7 +116,7 @@ async fn downstream_writer(
 
 #[embassy_executor::task]
 async fn downstream_reader(
-    mut rx: UartRx<'static, DOWNSTREAM_UART>,
+    mut rx: UartRx<'static, DownstreamUart>,
     mut upstream: QueueProducer,
     data_available: DataAvailableSignal,
 ) {
@@ -193,7 +134,7 @@ async fn downstream_reader(
 
 #[embassy_executor::task]
 async fn upstream_writer(
-    mut tx: UartTx<'static, UPSTREAM_UART>,
+    mut tx: UartTx<'static, UpstreamUart>,
     mut upstream: QueueConsumer,
     data_available: DataAvailableSignal,
 ) {
@@ -210,29 +151,6 @@ async fn upstream_writer(
     }
 }
 
-// TODO: how can we detect when rx timeout has occured?
-// let timeout = UART1::register_block()
-//     .int_ena()
-//     .read()
-//     .rxfifo_tout_int_ena()
-//     .bit_is_set();
-// info!("timeout: {timeout}");
-
-// #[embassy_executor::task]
-// async fn comms(upstream: FrameChannel, downstream: FrameChannel) {
-//     // TODO: check if actually at end of chain
-//     let mut at_end = true;
-
-//     //downstream.try_receive()
-
-//     //    let mut state = Init;
-
-//     loop {
-//         let f = upstream.receive().await;
-//         info!("msg  {:?}", f.message);
-//     }
-// }
-
 #[main]
 async fn main(spawner: embassy_executor::Spawner) {
     esp_println::logger::init_logger_from_env();
@@ -246,14 +164,16 @@ async fn main(spawner: embassy_executor::Spawner) {
     let timer_group0 = esp32s3_hal::timer::TimerGroup::new(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0);
 
-    let boot_delay = Timer::after(Duration::from_millis(40));
+    let ping_tx_delay = Timer::after(Duration::from_millis(STARTUP_DELAY_MILLIS as u64 / 2));
+    let ping_rx_delay = Timer::after(Duration::from_millis(STARTUP_DELAY_MILLIS as u64));
 
-    // UART
+    //////////////////////////////
+    // UART setup
 
     let (upstream_uart, downstream_uart) = {
         use esp32s3_hal::uart::{config::*, TxRxPins};
         let config = Config {
-            baudrate: 115200,
+            baudrate: BAUD_RATE as u32,
             data_bits: DataBits::DataBits8,
             parity: Parity::ParityNone,
             stop_bits: StopBits::STOP1,
@@ -304,17 +224,20 @@ async fn main(spawner: embassy_executor::Spawner) {
     let (up, uc) = UPSTREAM.try_split().unwrap();
     let (dp, dc) = DOWNSTREAM.try_split().unwrap();
 
+    let status_signal: StatusSignal = &*make_static!(Signal::new());
+    let command_signal: CommandSignal = &*make_static!(Signal::new());
+
     ///////////////////////////////////////
     // Detect if device is at end of chain
 
     // give upstream neighbor time to boot up, then send it init message
-    Timer::after(Duration::from_millis(20)).await;
+    ping_tx_delay.await;
     embedded_io_async::Write::write(&mut utx, &PING_FRAME)
         .await
         .unwrap();
 
     // wait as long as possible for our downstream neighbor's message
-    boot_delay.await;
+    ping_rx_delay.await;
 
     let device_at_end = {
         let mut buf = [0; PING_FRAME.len()];
@@ -326,28 +249,113 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     info!("Device at end: {device_at_end}");
 
-    let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
-    let pin = io.pins.gpio38;
+    /////////////////////////
+    // Spawn comms tasks
 
     if device_at_end {
-        spawner.spawn(upstream_reader(urx, up, uda, rmt, pin)).ok();
+        spawner
+            .spawn(upstream_reader(urx, up, uda, status_signal, command_signal))
+            .ok();
         spawner.spawn(upstream_writer(utx, uc, uda)).ok();
     } else {
-        spawner.spawn(upstream_reader(urx, dp, dda, rmt, pin)).ok();
+        spawner
+            .spawn(upstream_reader(urx, dp, dda, status_signal, command_signal))
+            .ok();
         spawner.spawn(downstream_writer(dtx, dc, dda)).ok();
         spawner.spawn(downstream_reader(drx, up, uda)).ok();
         spawner.spawn(upstream_writer(utx, uc, uda)).ok();
     }
 
-    // Blinky LED
-    // {
-    //     let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
-    //     spawner.spawn(led(rmt, io.pins.gpio38)).ok();
-    // }
+    /////////////////////////
+    // Device task
+    // (Too painful to write out types for async task, so just run here at end of main.)
 
-    info!("Tasks spawned");
+    #[cfg(feature = "led")]
+    {
+        use esp32s3_hal::Rmt;
+        use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
+        use smart_leds::SmartLedsWrite;
+        let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
+        let pin = io.pins.gpio38;
 
-    // let upstream = &*make_static!(Channel::new());
-    // let downstream = &*make_static!(Channel::new());
-    // spawner.spawn(comms(upstream, downstream)).ok();
+        let mut led = {
+            let ch = rmt.channel0;
+            let mut led = SmartLedsAdapter::new(ch, pin, smartLedBuffer!(1));
+            move |l: Light| {
+                use smart_leds::RGB8;
+                let c = match l {
+                    device::led::Light::Off => RGB8 { r: 0, g: 0, b: 0 },
+                    device::led::Light::On(Color { r, g, b }) => RGB8 { r, g, b },
+                };
+                let _ = led.write([c].into_iter());
+                info!("cmd: {:?}", &l);
+                status_signal.signal(l);
+            }
+        };
+
+        // Set default light value
+        led(Light::On(Color { r: 0, g: 10, b: 0 }));
+
+        loop {
+            led(command_signal.wait().await);
+        }
+    }
+
+    #[cfg(feature = "temp-sensor")]
+    {
+        use esp32s3_hal::{
+            dma::DmaPriority,
+            dma_descriptors,
+            gdma::Gdma,
+            spi::{
+                master::{prelude::*, Spi},
+                SpiMode,
+            },
+        };
+
+        let dma = Gdma::new(peripherals.DMA);
+        let dma_channel = dma.channel0;
+
+        let (mut descriptors, mut rx_descriptors) = dma_descriptors!(32000);
+
+        let mut vcc = io.pins.gpio13.into_push_pull_output();
+        vcc.set_high().unwrap();
+
+        let mut gnd = io.pins.gpio14.into_push_pull_output();
+        gnd.set_low().unwrap();
+
+        let mut spi = Spi::new(peripherals.SPI3, 4u32.MHz(), SpiMode::Mode0, &clocks)
+            .with_miso(io.pins.gpio10)
+            .with_cs(io.pins.gpio11)
+            .with_sck(io.pins.gpio12)
+            .with_dma(dma_channel.configure(
+                false,
+                &mut descriptors,
+                &mut rx_descriptors,
+                DmaPriority::Priority0,
+            ));
+
+        let mut buf = [0u8; 2];
+
+        // https://www.analog.com/media/en/technical-documentation/data-sheets/MAX6675.pdf
+        let conversion_time = Duration::from_millis(220);
+
+        // wait for initial conversion so we don't read garbage
+        Timer::after(conversion_time).await;
+
+        loop {
+            // Temp sensor has no commands
+            //let _last_command = command_signal.wait().await;
+
+            embedded_hal_async::spi::SpiBus::read(&mut spi, &mut buf)
+                .await
+                .unwrap();
+            Timer::after(Duration::from_millis(500)).await;
+
+            // https://www.analog.com/media/en/technical-documentation/data-sheets/MAX6675.pdf
+            let temp_c = 0.25 * (u16::from_be_bytes(buf) >> 3) as f32;
+            debug!("temp: {}; bytes: {:?}", temp_c, buf);
+            status_signal.signal(TempCelcius(temp_c));
+        }
+    }
 }

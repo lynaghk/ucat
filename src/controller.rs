@@ -1,8 +1,8 @@
-use core::{marker::PhantomData, ops::Range};
-
+pub use crate::MAX_FRAME_SIZE;
 use crate::*;
-
+use core::{marker::PhantomData, ops::Range};
 use log::*;
+
 pub async fn wait_for<R>(mut r: R, bs: &[u8]) -> Result<(), Error>
 where
     R: Read,

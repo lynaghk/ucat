@@ -1,11 +1,94 @@
-# ucat: lil' PLC-ish framework.
+# ucat: A cheap and cheerful modular hardware system.
 
-## Install
+I'm aware of two ways to throw together electromechanical systems:
 
-cargo install --locked --root ".cargo-installed/" --version 0.10.0 espup
-cargo install --locked --root ".cargo-installed/" --version 2.1.0 espflash
+1. microcontrollers with I2C / SPI breakout boards (cheap, but tedious), and
+2. industrial PLC / fieldbus systems (convenient, but expensive and overkill for many applications)
 
-espup install --targets esp32s3,esp32c3
+The core hypothesis of ucat is that a bit of well-designed hardware and compute can provide the speed, convenience, and IO-scalability benefits of the latter while maintaining the price-point of the former.
+
+ucat consists of:
+
+- a single-controller, multi-device network protocol based on daisy-chained UART with automatic addressing based on daisy-chain position
+- a physical interconnect standard, so devices can be quickly connected without tools or wires
+- a reference controller implementation in Rust, usable on both Mac/Windows/Linux as well as no-std embedded contexts
+
+design goals:
+
+- minimal hardware requirements
+  - no custom communication ICs (this rules out USB, CAN, RS-485, ethernet, etc.)
+  - JLCPCB's cheapest 32-bit MCU (the $0.48 stm32g030) should be able to act as a device OR controller
+- suitable for < 1 W power applications (e.g., powered by USB powerbank and solar)
+- latency should scale linearly with IO
+
+
+## Example
+
+```rust
+use ucat::controller::*;
+
+// Open (blocking) serial port and wrap in `Port` NewType to implement async Read/Write
+let mut port = Port(serialport::new("/dev/tty.usbserial-AQ0445MZ", 115_200).open()?);
+
+// A buffer for the data we send to and receive back from the ucat network.
+let mut buf = [0u8; MAX_FRAME_SIZE];
+
+// Create a new network with a single device group.
+let mut network = Network::<_, 1>::new(&mut port);
+
+// Add the temperature sensor and led. These calls must match the physical daisy-chained order (and will error otherwise).
+// These are *not* RPC handles; rather, they're used to provide a typed API to write/read from the buffer that's cycled through the network.
+let temp = network.add(TempSensor {}).await.unwrap();
+let led = network.add(Led {}).await.unwrap();
+
+let mut n = 0;
+loop {
+    // Create a new PDI into which we can write commands.
+    let mut pdi = network.pdi(&mut buf);
+
+    // Instruct the LED to get brighter.
+    pdi.command(&led, &Light::On(Color { r: n, g: n, b: n }));
+    n = n.wrapping_add(1);
+
+    // send this PDI through the network, delivering commands to all devices in the group and returning their statuses.
+    // The returned PDI has been "cycled" and Rust will prevent you from accidentally writing any new commands to it.
+    let pdi = network.cycle(pdi).await.unwrap();
+
+    info!("The latest temp reading: {:?}", pdi.status(&temp));
+}
+```
+
+## Repo overview
+
+Everything is work in progress.
+
+Roughly:
+
+- src/
+  - lib.rs - core protocol and device implementation
+  - controller.rs - controller implementation
+  - device.rs - some toy device schema that should eventually get moved into individual crates
+
+- boards/ - device firmware
+  - esp32s3-embassy/ - the prototype device firmware, uses feature flags to specialize for device type
+
+- scratch/ - crate of misc binaries (including controllers that run on my Mac)
+
+ 
+## Roadmap
+
+### V0
+
+- [x] nostd ucat device library
+- [x] proof of concept networking over UART
+- [ ] control LEDs on three esp32s3 via eui
+- [ ] device latency test
+
+### V1
+
+- [ ] rework protocol so devices reply upstream when addressed directly or at end of group. this will reduce latency and make it easier to detect failed devices by "counting up"
+- [ ] controller live reload
+
 
 ## Protocol invariants
 
@@ -13,26 +96,32 @@ espup install --targets esp32s3,esp32c3
 - pdi_window of all zeros should be interpreted as "no command"
 - end device must buffer entire frame in memory so no devices need to worry about simultanious send/recv.
 
-## Roadmap
-
-### V0
-
-- nostd ucat device library
-- proof of concept networking over UART
-- control LEDs on three esp32s3 via eui
-- device latency test / protocol
 
 ## Open questions
 
 - dynamic UART baud rate? PING message could contain downstream device's max supported speed. Would need ack from upstream device. Probably too complicated.
+- how should controller handle devices being added/removed from network? Simplest is to restart everything on any network error, though that may not be suitable for all applications...
+
 
 ## Notes
 
-to generate cargo demo project:
+### Install
+
+    cargo install --locked --root ".cargo-installed/" --version 0.10.0 espup
+    cargo install --locked --root ".cargo-installed/" --version 2.1.0 espflash
+
+    espup install --targets esp32s3,esp32c3
+
+
+### Rust garbage
+
+to generate cargo demo project
 
     cargo generate esp-rs/esp-idf-template cargo
 
 rust-analyzer must be installed *without* rustup, otherwise there will be toolchain errors.
+
+### to investigate
 
 https://github.com/udoprog/bittle for bitsets?
 
@@ -262,4 +351,4 @@ Also looked into stm32 "passthrough" DMA --- seems like it'll be tricker than I 
 
 
 ## Thanks
-Thanks to James Waples for helpful discussions on protocol and API design.
+Thanks to James Waples and Jeff McBride for helpful discussions on protocol and API design.

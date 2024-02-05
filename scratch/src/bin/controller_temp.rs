@@ -2,8 +2,6 @@ use embedded_io_async::{Read, Write};
 use log::*;
 use ucat::controller::*;
 
-use ucat::*;
-
 ////////////////////////////////////////
 // Paperwork to use serial port async
 
@@ -36,6 +34,7 @@ impl Write for Port {
     }
 }
 
+use ucat::device::led::{Color, Led, Light};
 use ucat::device::temp_sensor::TempSensor;
 
 pub fn main() -> anyhow::Result<()> {
@@ -44,26 +43,37 @@ pub fn main() -> anyhow::Result<()> {
             .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
             .init();
 
+        // Open (blocking) serial port and wrap in `Port` NewType to implement async Read/Write
         let mut port = Port(serialport::new("/dev/tty.usbserial-AQ0445MZ", 115_200).open()?);
-        port.0
-            .set_timeout(std::time::Duration::from_millis(1000000000000))?;
 
-        ///////////////////
-        // Wait for ping
-
-        //let _ = wait_for_ping_frame(&mut port).await.unwrap();
-
+        // A buffer for the data we send to and receive back from the ucat network.
         let mut buf = [0u8; MAX_FRAME_SIZE];
+
+        // Create a new network with a single device group
         let mut network = Network::<_, 1>::new(&mut port);
-        let s1 = network.add(TempSensor {}).await.unwrap();
 
-        ///////////////////
-        // Process Update 1
+        // Add the temperature sensor. This will return an error if the first device isn't a temperature sensor.
+        let temp = network.add(TempSensor {}).await.unwrap();
 
+        // Add the LED
+        let led = network.add(Led {}).await.unwrap();
+
+        // Loop
+
+        let mut n = 0;
         loop {
-            let pdi = network.pdi(&mut buf);
+            // create a new PDI into which we can write commands
+            let mut pdi = network.pdi(&mut buf);
+
+            // Instruct the LED to get brighter
+            pdi.command(&led, &Light::On(Color { r: n, g: n, b: n }));
+            n = n.wrapping_add(1);
+
+            // send this PDI through the network, delivering commands to all devices in the group and returning their statuses.
+            // The returned PDI has been "cycled" and Rust will prevent you from accidentally writing any new commands to it.
             let pdi = network.cycle(pdi).await.unwrap();
-            dbg!(pdi.status(&s1));
+
+            info!("The latest temp reading: {:?}", pdi.status(&temp));
         }
     })
 }

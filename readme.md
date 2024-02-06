@@ -9,7 +9,7 @@ The core hypothesis of ucat is that a bit of well-designed hardware and compute 
 
 ucat consists of:
 
-- a single-controller, multi-device network protocol based on daisy-chained UART with automatic addressing based on daisy-chain position
+- a single-controller, multi-device network protocol based on daisy-chained UART with automatic addressing
 - a physical interconnect standard, so devices can be quickly connected without tools or wires
 - a reference controller implementation in Rust, usable on both Mac/Windows/Linux as well as no-std embedded contexts
 
@@ -58,6 +58,62 @@ loop {
 }
 ```
 
+## Protocol overview
+
+Devices are connected via daisy-chained UART, with a single controller at the start of the chain ("upstream").
+The controller sends messages to the immediately connected device, which either responds or passes the message downstream to its neighbor, etc.
+Invariants:
+
+- only the controller can initiate transmissions
+- only a single message can be "in flight" at a time
+- devices always forward messages upstream (back to the controller)
+
+The protocol supports two kinds of messages: device-addressed and group-addressed.
+
+Device-addressed messages are simple request/response interactions, with the device address based on the chain position.
+To send a message to the Nth device, the controller addresses it to -N and each device increments the address when forwarding the message downstream.
+The device that recieves a message addressed to device zero responds.
+
+The `ProcessUpdate` group-addressed message exists to reduce latency and improve bandwidth compared to single-device request/response messages.
+The controller sends an `Initialize` message to a device to assign it to a group and provide an offset into that group's `ProcessUpdate` message payload (the "process data image").
+When an initialized device receives a `ProcessUpdate` message addressed to its group, it reads an (optional) command from its assigned offset and writes its latest status into the same location.
+The group's last device returns the `ProcessUpdate` message upstream.
+
+
+All messages share this format:
+
+- message type: 1 byte
+- address: 2 bytes
+- payload size: 2 bytes
+- payload: (variable size)
+- CRC: 4 bytes
+
+The controller detects network faults via CRC mismatch and response timeout.
+
+
+### Typical operation
+
+When the controller has been programmed for a network of known devices, it will:
+
+- (optionally) request each device to identify itself to confirm expectations
+- initialize the devices into groups
+- begin the "process loop" of sending and receving `ProcessUpdate` messages; note that the controller can poll groups at different rates (e.g., temperature sensors at 1 Hz and motors at 100 Hz)
+
+In a prototyping context, the controller can dynamically discover devices by
+
+- polling increasing addresses until one times out
+- sending `Identify` messages to newly discovered devices
+
+
+### Further notes
+
+- devices have two network states: `Reset` (unassigned) and `Initialized` (assigned to a group)
+- the maximum message size is 2kB, though this arbitrary limit may be revised after testing
+- devices must process the message type and address to determine if they should forward downstream or reply upstream; each device thus adds a network latency of (best case) 3 bytes / ( baud rate / 10 bits-per-byte ) = 26 us (at 115_200 baud)
+- devices should interpret a PDI window of all zeros as "no command"
+- if a transmission ends unexpectedly, the recieving device should reset parsing and wait for the next message
+
+
 ## Repo overview
 
 Everything is work in progress.
@@ -90,17 +146,11 @@ Roughly:
 - [ ] controller live reload
 
 
-## Protocol invariants
-
-- single frame on network at a time
-- pdi_window of all zeros should be interpreted as "no command"
-- end device must buffer entire frame in memory so no devices need to worry about simultanious send/recv.
-
-
 ## Open questions
 
 - dynamic UART baud rate? PING message could contain downstream device's max supported speed. Would need ack from upstream device. Probably too complicated.
 - how should controller handle devices being added/removed from network? Simplest is to restart everything on any network error, though that may not be suitable for all applications...
+- should end device must buffer entire frame in memory so other devices never need to worry about simultanious send/recv?
 
 
 ## Notes

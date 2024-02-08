@@ -12,20 +12,6 @@ pub fn main() -> anyhow::Result<()> {
 
     let mut outgoing = [0u8; MAX_FRAME_SIZE];
     let mut incoming = [0u8; MAX_FRAME_SIZE];
-    // info!(
-    //     "{:?}",
-    //     create_frame(&mut outgoing, MessageType::Init, Address(0), &[])
-    // );
-
-    // wait_for_init_frame(&mut port);
-    // info!("init frame recieved");
-
-    port.write_all(&create_frame(
-        &mut outgoing,
-        MessageType::Enumerate,
-        Address(0),
-        &[],
-    ))?;
 
     let group_address = Address(7);
     let pdi_length = 2;

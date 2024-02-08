@@ -6,23 +6,17 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", features = ["experimental-derive"]  }
-heapless = { version = "0.8", features = ["serde"] }
 num_enum = { version = "0.7", default-features = false }
 crc = "3"
-const-str = "0.5"
-
-# TODO: pull this out into device crate just for derive schema. Maybe make that crate available separately.
-eui = { path = "../eui", optional = true }
-
 embedded-io = "0.6"
 embedded-io-async = "0.6"
-bbqueue = "0.5"
 log = "0.4"
 thiserror = { version = "1.0", package = "thiserror-core", default-features = false }
-
 # TODO: Use this to communicate between frame handling thread and status/command thread?
 # atomic_pingpong = "0.2.3"
 
+# TODO: pull this out into device crate just for derive schema. Maybe make that crate available separately.
+eui = { path = "../eui", optional = true }
 
 [dev-dependencies]
 smol = "2"

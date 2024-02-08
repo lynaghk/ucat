@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
-use bbqueue::{BBBuffer, Consumer, Producer};
+use embassy_futures::yield_now;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
 use esp32s3_hal::{
@@ -10,36 +10,13 @@ use esp32s3_hal::{
     embassy,
     peripherals::{Peripherals, UART1, UART2},
     prelude::*,
-    Uart, UartRx, UartTx, IO,
+    Uart, IO,
 };
 use esp_backtrace as _;
-use esp_println::dbg;
 
-use futures::future::FutureExt;
 use log::*;
 use static_cell::make_static;
 use ucat::*;
-
-// Interrupt will be triggered after these many bytes.
-// FIFO buffers are 128 bytes by default. All three UART controllers on ESP32-S3 share 1024 × 8 bits of RAM. As Figure 26-3 illustrates, the RAM is divided into 8 blocks, each having 128 × 8 bits.
-const RX_INTERRUPT_THRESHOLD: usize = 4;
-//const TX_INTERRUPT_THRESHOLD: usize = 32;
-
-const BUFFER_SIZE: usize = ucat::MAX_FRAME_SIZE * 2;
-
-static UPSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
-static DOWNSTREAM: BBBuffer<BUFFER_SIZE> = BBBuffer::new();
-
-type UpstreamUart = UART1;
-type DownstreamUart = UART2;
-
-type QueueProducer = Producer<'static, BUFFER_SIZE>;
-type QueueConsumer = Consumer<'static, BUFFER_SIZE>;
-type DataAvailableSignal = &'static Signal<NoopRawMutex, ()>;
-type StatusSignal = &'static Signal<NoopRawMutex, Status>;
-type CommandSignal = &'static Signal<NoopRawMutex, Command>;
-type Status = <DeviceType as Device>::Status;
-type Command = <DeviceType as Device>::Command;
 
 // TODO: move this into shared schema crate, not ucat.
 #[cfg(feature = "led")]
@@ -48,23 +25,65 @@ use ucat::device::led::{postcard, Color, Led as DeviceType, Light, PDI_WINDOW_SI
 #[cfg(feature = "temp-sensor")]
 use ucat::device::temp_sensor::{postcard, TempCelcius, TempSensor as DeviceType, PDI_WINDOW_SIZE};
 
+// Interrupt will be triggered after these many bytes.
+// FIFO buffers are 128 bytes by default. All three UART controllers on ESP32-S3 share 1024 × 8 bits of RAM. As Figure 26-3 illustrates, the RAM is divided into 8 blocks, each having 128 × 8 bits.
+const RX_INTERRUPT_THRESHOLD: usize = 4;
+//const TX_INTERRUPT_THRESHOLD: usize = 32;
+
+type UpstreamUart = UART1;
+type DownstreamUart = UART2;
+
+type StatusSignal = &'static Signal<NoopRawMutex, Status>;
+type CommandSignal = &'static Signal<NoopRawMutex, Command>;
+type Status = <DeviceType as Device>::Status;
+type Command = <DeviceType as Device>::Command;
+
 #[embassy_executor::task]
-async fn upstream_reader(
-    mut rx: UartRx<'static, UpstreamUart>,
-    mut downstream: QueueProducer,
-    data_available: DataAvailableSignal,
+async fn comms(
+    mut upstream: Uart<'static, UpstreamUart>,
+    mut downstream: Uart<'static, DownstreamUart>,
     status: StatusSignal,
     command: CommandSignal,
 ) {
     let mut state = DeviceState::Reset;
     let mut status_buf = [0u8; PDI_WINDOW_SIZE];
     let mut command_buf = [0u8; PDI_WINDOW_SIZE];
+    let mut frame_buf = [0u8; MAX_FRAME_SIZE];
+
     let mut last_status = status.wait().await;
 
-    let data_available = || data_available.signal(());
+    macro_rules! rx_available {
+        ($uart: ident) => {{
+
+            // This seems to return the right count for upstream uart, but always has 1 for the downstream uart.
+            // If that's noise, I'm not sure why the read doesn't clear it when it times out and the future gets cancelled.
+            let count: u16 = $uart::register_block()
+                .status()
+                .read()
+                .rxfifo_cnt()
+                .bits()
+                .into();
+            //info!("rx {count}");
+            count != 0
+
+            // $uart::register_block()
+            //     .fsm_status()
+            //     .read()
+            //     .st_urx_out()
+            //     .bits()
+            //     != 0x0u8
+
+
+        }};
+    }
+
+    let upstream_rx_available = || rx_available!(UpstreamUart);
+    let downstream_rx_available = || rx_available!(DownstreamUart);
 
     // TODO: use rx idle timeout interrupt rather than embassy timeout here.
     let timeout = Duration::from_millis(500);
+    //let (mut upstream_tx, mut upstream_rx) = upstream.split();
+
     loop {
         // TODO: refactor so handle_frame can use most recent status buffer when it's writing out to PDI?
         // Status gets "stale" while waiting for PDI.
@@ -73,81 +92,73 @@ async fn upstream_reader(
         }
         postcard::to_slice(&last_status, &mut status_buf).unwrap();
 
-        let f = handle_frame(
-            state.clone(),
-            &status_buf,
-            &mut command_buf,
-            &mut rx,
-            &mut downstream,
-            data_available,
-        );
+        // TODO: use async select with cancel-safe ReadReady traits on uarts so we can
+        // (or just use DMA for upstream forwarding, if possible)
 
-        let Ok(result) = embassy_time::with_timeout(timeout, f).await else {
-            error!("Timed out waiting for message");
-            continue;
-        };
+        if upstream_rx_available() {
+            let f = handle_frame(
+                state.clone(),
+                &status_buf,
+                &mut command_buf,
+                &mut frame_buf,
+                &mut upstream_rx,
+                &mut upstream_tx,
+                &mut downstream,
+            );
 
-        match result {
-            Err(e) => {
-                error!("Unexpected device error: {e:?}");
-                return;
-            }
-            Ok(None) => {}
-            Ok(Some(action)) => match action {
-                Action::NewState(s) => state = s,
-                Action::NewCommand(cmd) => {
-                    if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
-                        command.signal(cmd)
-                    }
+            let Ok(result) = embassy_time::with_timeout(timeout, f).await else {
+                error!("Timed out waiting for upstream message");
+                continue;
+            };
+
+            match result {
+                Err(e) => {
+                    error!("Unexpected device error: {e:?}");
+                    continue;
                 }
-            },
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn downstream_writer(
-    _tx: UartTx<'static, DownstreamUart>,
-    mut _consumer: QueueConsumer,
-    _data_available: DataAvailableSignal,
-) {
-    todo!();
-}
-
-#[embassy_executor::task]
-async fn downstream_reader(
-    mut rx: UartRx<'static, DownstreamUart>,
-    mut upstream: QueueProducer,
-    data_available: DataAvailableSignal,
-) {
-    loop {
-        let mut g = upstream.grant_exact(RX_INTERRUPT_THRESHOLD).unwrap();
-        match embedded_io_async::Read::read(&mut rx, &mut g.buf()).await {
-            Ok(n) => {
-                g.commit(n);
-                data_available.signal(());
+                Ok(None) => {}
+                Ok(Some(action)) => match action {
+                    Action::NewState(s) => state = s,
+                    Action::NewCommand(cmd) => {
+                        if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
+                            command.signal(cmd)
+                        }
+                    }
+                },
             }
-            Err(e) => error!("Downstream RX Error: {:?}", e),
         }
-    }
-}
 
-#[embassy_executor::task]
-async fn upstream_writer(
-    mut tx: UartTx<'static, UpstreamUart>,
-    mut upstream: QueueConsumer,
-    data_available: DataAvailableSignal,
-) {
-    loop {
-        if let Ok(g) = upstream.read() {
-            match embedded_io_async::Write::write(&mut tx, &g.buf()).await {
-                Ok(n) => g.release(n),
-                Err(e) => error!("TX Error: {:?}", e),
-            }
-        } else {
-            data_available.wait().await;
-            data_available.reset();
+        if downstream_rx_available() {
+            info!("forwarding upstream...");
+            let f = read_frame(&mut frame_buf, &mut downstream);
+            let Ok(frame) = embassy_time::with_timeout(timeout, f).await else {
+                error!("Timed out waiting for downstream message");
+                continue;
+            };
+
+            embedded_io_async::Write::write_all(&mut upstream_tx, frame.unwrap())
+                .await
+                .unwrap();
+            info!("forwarded upstream");
         }
+
+        // TODO: investigate likely esp hal bug: when downstream_rx_available() I can blocking read a byte but future read never resolves.
+        // while upstream_rx_available() {
+        //     info!("upstream: {:?}", upstream.read().unwrap());
+        // }
+        // while downstream_rx_available() {
+        //     info!("reading downstream...");
+        //     //info!("downstream: {:?}", downstream.read().unwrap());
+
+        //     let mut buf = [0; 1];
+        //     embedded_io_async::Read::read_exact(&mut downstream, &mut buf)
+        //         .await
+        //         .unwrap();
+        //     info!("downstream: {:?}", buf);
+        // }
+
+        // yield so this loop doesn't starve CPU.
+        yield_now().await;
     }
 }
 
@@ -164,13 +175,10 @@ async fn main(spawner: embassy_executor::Spawner) {
     let timer_group0 = esp32s3_hal::timer::TimerGroup::new(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0);
 
-    let ping_tx_delay = Timer::after(Duration::from_millis(STARTUP_DELAY_MILLIS as u64 / 2));
-    let ping_rx_delay = Timer::after(Duration::from_millis(STARTUP_DELAY_MILLIS as u64));
-
     //////////////////////////////
     // UART setup
 
-    let (upstream_uart, downstream_uart) = {
+    let (upstream, downstream) = {
         use esp32s3_hal::uart::{config::*, TxRxPins};
         let config = Config {
             baudrate: BAUD_RATE as u32,
@@ -216,55 +224,15 @@ async fn main(spawner: embassy_executor::Spawner) {
         (us, ds)
     };
 
-    let (mut utx, urx) = upstream_uart.split();
-    let (dtx, mut drx) = downstream_uart.split();
-
-    let uda = &*make_static!(Signal::new());
-    let dda = &*make_static!(Signal::new());
-    let (up, uc) = UPSTREAM.try_split().unwrap();
-    let (dp, dc) = DOWNSTREAM.try_split().unwrap();
-
     let status_signal: StatusSignal = &*make_static!(Signal::new());
     let command_signal: CommandSignal = &*make_static!(Signal::new());
 
-    ///////////////////////////////////////
-    // Detect if device is at end of chain
-
-    // give upstream neighbor time to boot up, then send it init message
-    ping_tx_delay.await;
-    embedded_io_async::Write::write(&mut utx, &PING_FRAME)
-        .await
-        .unwrap();
-
-    // wait as long as possible for our downstream neighbor's message
-    ping_rx_delay.await;
-
-    let device_at_end = {
-        let mut buf = [0; PING_FRAME.len()];
-        match embedded_io_async::Read::read_exact(&mut drx, &mut buf).now_or_never() {
-            Some(Ok(())) if buf == PING_FRAME => false,
-            _ => true,
-        }
-    };
-
-    info!("Device at end: {device_at_end}");
-
     /////////////////////////
-    // Spawn comms tasks
+    // Spawn comms task
 
-    if device_at_end {
-        spawner
-            .spawn(upstream_reader(urx, up, uda, status_signal, command_signal))
-            .ok();
-        spawner.spawn(upstream_writer(utx, uc, uda)).ok();
-    } else {
-        spawner
-            .spawn(upstream_reader(urx, dp, dda, status_signal, command_signal))
-            .ok();
-        spawner.spawn(downstream_writer(dtx, dc, dda)).ok();
-        spawner.spawn(downstream_reader(drx, up, uda)).ok();
-        spawner.spawn(upstream_writer(utx, uc, uda)).ok();
-    }
+    spawner
+        .spawn(comms(upstream, downstream, status_signal, command_signal))
+        .ok();
 
     /////////////////////////
     // Device task

@@ -157,7 +157,7 @@ Roughly:
 
 ### Install
 
-    cargo install --locked --root ".cargo-installed/" --version 0.10.0 espup
+    cargo install --locked --root ".cargo-installed/" --version 0.11.0 espup
     cargo install --locked --root ".cargo-installed/" --version 2.1.0 espflash
 
     espup install --targets esp32s3,esp32c3
@@ -183,6 +183,46 @@ parsing options:
   
   
 ## Log
+
+### Feb 6/7/8 - Refactor protocol, simplify reference implementation
+
+Decided to change protocol so devices reply directly when possible rather than always forwarding messages to the end of the chain.
+This lets us eliminate the "ping upstream on startup" behavior, which should make things more robust / less stateful moving forward --- the controller should be able to detect failures via timeouts and reconfigure as needed.
+
+I also simplified the reference implementation to buffer the entire frame in memory --- if we actually need superfast streaming, it's probably better to write a device-specific implementation rather than using rust async traits.
+
+However, this redesign feels a bit awkward when it comes to the "main loop" of the devices, as they now need to juggle UARTs between awaiting upstream frames and downstream frames.
+The esp-hal doesn't seem to offer a nice way to do this with async, so I'm reading the FIFO registers and busy-looping (alas).
+
+Furthermore, I managed to run into a rust compiler bug related to calling `.register_block()` on an instance.
+I worked around by referencing the instance's underyling UART type explicitly myself.
+
+In hardware I'm able to pass messages downstream successfully, but not able to return from the second device.
+
+There seems to be a single (glitch) byte that shows up in the UART2 (downstream) fifo after reset.
+That's according to
+
+    let count: u16 = $uart::register_block()
+        .status()
+        .read()
+        .rxfifo_cnt()
+        .bits()
+        .into();
+
+and I can blocking read the byte (seems to always be 0).
+
+However, if I try to use an async read, it never resolves even though there's already byte in the fifo.
+The async hal impl relies on some interrupt stuff, and I've set `set_rx_fifo_full_threshold` set to 0 or 1 and have a rx timeout set, both of which should raise interrupts.
+Hmm.
+
+Even putting this aside, I can't find a clean way to express the domain logic using Rust async.
+The core issue is that I have two distinct tasks:
+
+- handling from upstream
+- handling from downstream
+
+both need a reference to upstream TX, and I want to await on both simultaneously.
+
 ### Feb 2 - API design
 
 I didn't like where the macro complexity was going, so decided to try the controller network setup API again.

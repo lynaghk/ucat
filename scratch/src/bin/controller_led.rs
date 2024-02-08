@@ -70,28 +70,30 @@ pub fn main() -> anyhow::Result<()> {
         port.0
             .set_timeout(std::time::Duration::from_millis(1000000000000))?;
 
-        ///////////////////
-        // Wait for ping
-
-        //let _ = wait_for_ping_frame(&mut port).await.unwrap();
-
         let mut buf = [0u8; MAX_FRAME_SIZE];
         let mut network = Network::<_, 1>::new(&mut port);
 
         let l1 = network.add(Led {}).await.unwrap();
+        debug!("led 1 setup");
+        let l2 = network.add(Led {}).await.unwrap();
+        debug!("led 2 setup");
 
         ///////////////////
         // Process Update 1
         let mut pdi = network.pdi(&mut buf);
         pdi.command(&l1, &Light::Off);
+        pdi.command(&l2, &Light::Off);
         let pdi = network.cycle(pdi).await.unwrap();
+        debug!("pdi 1 cycled");
         dbg!(pdi.status(&l1));
 
         ///////////////////
         // Process Update 2
         let mut pdi = pdi.reset();
-        pdi.command(&l1, &Light::On(Color { r: 10, g: 0, b: 10 }));
+        pdi.command(&l1, &Light::On(Color { r: 10, g: 0, b: 0 }));
+        pdi.command(&l2, &Light::On(Color { r: 0, g: 0, b: 10 }));
         let pdi = network.cycle(pdi).await.unwrap();
+        debug!("pdi 2 cycled");
         dbg!(pdi.status(&l1));
 
         ///////////////////
@@ -105,6 +107,7 @@ pub fn main() -> anyhow::Result<()> {
 
             while let Ok(c) = cmd_rx.try_recv() {
                 pdi.command(&l1, &c.a);
+                pdi.command(&l2, &c.b);
                 pdi = network.cycle(pdi).await.unwrap().reset();
             }
         }

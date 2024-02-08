@@ -1,4 +1,4 @@
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(feature = "std"), no_std)] // TODO: this is only used for tests, maybe there's a better way to do this?
 #![feature(error_in_core)]
 
 pub mod controller;
@@ -11,16 +11,20 @@ use embedded_io_async::{Read, ReadExactError, Write};
 use log::*;
 use serde::{Deserialize, Serialize};
 
-pub type Digest = crc::Digest<'static, u32>;
+pub type CrcWidth = u32;
+pub type Digest = crc::Digest<'static, CrcWidth>;
 pub const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
 
 pub const MAX_FRAME_SIZE: usize = 2048;
 pub const PRE_PAYLOAD_BYTE_COUNT: usize =
     size_of::<MessageType>() + size_of::<DeviceOrGroupAddressOnWire>() + size_of::<PayloadLength>();
 pub const MAX_PAYLOAD_LENGTH: usize = MAX_FRAME_SIZE - PRE_PAYLOAD_BYTE_COUNT - CRC_BYTE_COUNT;
-pub const CRC_BYTE_COUNT: usize = 4;
+pub const CRC_BYTE_COUNT: usize = size_of::<CrcWidth>();
 pub const BAUD_RATE: usize = 115_200;
-pub const FRAME_SIZE_INITIALIZE: usize = PRE_PAYLOAD_BYTE_COUNT + 2 + 2 + CRC_BYTE_COUNT;
+pub const FRAME_SIZE_INITIALIZE: usize = PRE_PAYLOAD_BYTE_COUNT
+    + size_of::<DeviceOrGroupAddressOnWire>()
+    + size_of::<PDIOffset>()
+    + CRC_BYTE_COUNT;
 
 pub trait Device {
     type Command;
@@ -29,14 +33,6 @@ pub trait Device {
     fn pdi_window_size(&self) -> usize;
     fn status(&self, pdi_window: &[u8]) -> Self::Status;
     fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command);
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Frame<'a> {
-    pub message_type: MessageType,
-    pub address: DeviceOrGroupAddressOnWire,
-    pub payload: &'a [u8],
-    pub crc: u32, //CRC of everything above
 }
 
 type DeviceOrGroupAddressOnWire = i16;
@@ -81,8 +77,7 @@ pub struct DeviceInfo {
     pub name: &'static str,
 }
 
-//TODO: should this be copy?
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DeviceState {
     Reset,
     Initialized {
@@ -91,11 +86,17 @@ pub enum DeviceState {
     },
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, num_enum::TryFromPrimitive)]
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum WriteDirection {
+    Upstream,
+    Downstream,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum MessageType {
     // device increments address, then acts if address is 0.
-    Initialize, // device address, read payload: group address, PDI offset, end-of-group bool
+    Initialize, // device address, read payload: group address, PDI offset
     Identify,   // device address, write payload: DeviceInfo
     Query,      // device address, read/write payload: (device-specific types)
 
@@ -103,48 +104,42 @@ pub enum MessageType {
     ProcessUpdate, // group address, read/write payload: PDI
 }
 
-// TODO: Would be nice if this could be done at compile time, but Rust isn't there yet. May need to rely on build.rs --- oh, someone made a crate https://github.com/Eolu/const-gen
-// TODO: compare generated code here with a fn where I do all of the slice offset math myself.
-// chatgpt gave it a go, but requires dangerous nightly #![feature(generic_const_exprs)] https://chat.openai.com/share/f51804d9-3424-4690-900c-c00b73ccbf5e
-pub fn write_frame<'a>(
-    buf: &'a mut [u8],
-    t: MessageType,
-    address: DeviceOrGroupAddressOnWire,
-    payload: &[u8],
-) -> &'a [u8] {
-    let mut n = 0;
-
-    // TODO: is this macro usage horrible or fine? Not obvious if generated code is better or worse than a closure, and the latter has issues with letting CRC read buf.
-    macro_rules! write {
-        ($bs: expr) => {
-            let bs = $bs;
-            buf[n..(n + bs.len())].copy_from_slice(bs);
-            n += bs.len();
-        };
-    }
-
-    write!(&[t as u8]);
-    write!(&address.to_le_bytes());
-    write!(&(payload.len() as PayloadLength).to_le_bytes());
-    write!(payload);
-
-    let crc = CRC.checksum(&buf[0..n]);
-    write!(&crc.to_le_bytes());
-
-    &buf[0..n]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error {
+    IO(embedded_io_async::ErrorKind),
+    UnexpectedResponse,
+    InvalidLength,
+    InvalidPDIOffset,
+    CRC,
+    BadMessageType,
+    PDILengthMismatch,
 }
 
-#[cfg(feature = "std")]
-pub fn frame(t: MessageType, address: DeviceOrGroupAddressOnWire, payload: &[u8]) -> Vec<u8> {
-    let mut v = vec![0; MAX_FRAME_SIZE];
-    let len = write_frame(&mut v[..], t, address, payload).len();
-    v.truncate(len);
-    v
+pub struct ReadExactErrorWrapper<E>(pub ReadExactError<E>);
+
+impl<E: embedded_io_async::Error> From<ReadExactError<E>> for ReadExactErrorWrapper<E> {
+    fn from(error: ReadExactError<E>) -> Self {
+        ReadExactErrorWrapper(error)
+    }
+}
+impl<E: embedded_io_async::Error> From<ReadExactErrorWrapper<E>> for Error {
+    fn from(wrapper: ReadExactErrorWrapper<E>) -> Self {
+        match wrapper.0 {
+            ReadExactError::UnexpectedEof => Error::UnexpectedResponse,
+            ReadExactError::Other(e) => Error::IO(e.kind()),
+        }
+    }
+}
+
+impl<E: embedded_io_async::Error> From<E> for Error {
+    fn from(e: E) -> Self {
+        Error::IO(e.kind())
+    }
 }
 
 struct CRCWriter<W> {
     writer: W,
-    digest: crc::Digest<'static, u32>,
+    digest: Digest,
 }
 
 impl<W: Write> embedded_io::ErrorType for CRCWriter<W> {
@@ -190,7 +185,7 @@ impl<E: core::fmt::Debug> embedded_io_async::Error for CRCReaderError<E> {
 
 struct CRCReader<R> {
     reader: R,
-    digest: crc::Digest<'static, u32>,
+    digest: Digest,
 }
 
 impl<R: Read> embedded_io::ErrorType for CRCReader<R> {
@@ -204,18 +199,15 @@ impl<R: Read> CRCReader<R> {
             digest: CRC.digest(),
         }
     }
-    pub async fn read_crc(mut self) -> Result<(), Error> {
-        let mut buf = [0u8; CRC_BYTE_COUNT];
+    pub async fn read_crc(mut self, buf: &mut [u8]) -> Result<(), Error> {
         self.reader
-            .read_exact(&mut buf)
+            .read_exact(buf)
             .await
             .map_err(ReadExactErrorWrapper::from)?;
 
         if buf == self.digest.finalize().to_le_bytes() {
             Ok(())
         } else {
-            // TODO: better error?
-            //Error::IO(embedded_io_async::ErrorKind::InvalidData)
             Err(Error::CRC)
         }
     }
@@ -229,7 +221,7 @@ impl<R: Read> Read for CRCReader<R> {
     }
 }
 
-pub async fn write_frame2<W: Write>(
+pub async fn write_frame<W: Write>(
     writer: W,
     message_type: MessageType,
     address: DeviceOrGroupAddressOnWire,
@@ -245,91 +237,31 @@ pub async fn write_frame2<W: Write>(
     Ok(())
 }
 
-//////////////////
-//TODO: is there a proper way to do this error stuff?
-
-//use thiserror::Error;
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-    UnexpectedResponse,
-
-    //#[error("{0:?}")]
-    IO(embedded_io_async::ErrorKind),
-
-    TODO,
-    InvalidLength,
-    CRC,
-    BadMessageType,
-    PDILengthMismatch,
-}
-
-pub struct ReadExactErrorWrapper<E>(pub ReadExactError<E>);
-
-impl<E: embedded_io_async::Error> From<ReadExactError<E>> for ReadExactErrorWrapper<E> {
-    fn from(error: ReadExactError<E>) -> Self {
-        ReadExactErrorWrapper(error)
-    }
-}
-impl<E: embedded_io_async::Error> From<ReadExactErrorWrapper<E>> for Error {
-    fn from(wrapper: ReadExactErrorWrapper<E>) -> Self {
-        match wrapper.0 {
-            ReadExactError::UnexpectedEof => Error::UnexpectedResponse,
-            ReadExactError::Other(e) => Error::IO(e.kind()),
-        }
-    }
-}
-
-impl<E: embedded_io_async::Error> From<E> for Error {
-    fn from(e: E) -> Self {
-        Error::IO(e.kind())
-    }
-}
-
-// impl embedded_io_async::Error for Error {
-//     fn kind(&self) -> embedded_io::ErrorKind {
-//         match self {
-//             Error::UnexpectedResponse => embedded_io_async::ErrorKind::InvalidData,
-//             Error::IO(e) => e.kind(),
-//             Error::TODO => embedded_io_async::ErrorKind::Other,
-//             Error::CRC => embedded_io_async::ErrorKind::InvalidData,
-//             Error::BadMessageType => embedded_io_async::ErrorKind::InvalidData,
-//         }
-//     }
-// }
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Action<'out> {
     NewState(DeviceState),
-    // TODO: should this be a reference rather than allocated on the stack?
     NewCommand(&'out [u8]),
 }
 
-pub type PayloadIdx = core::ops::Range<usize>;
+/// Read full frame into frame_buf, checking CRC.
+pub async fn read_frame<R: Read>(frame_buf: &mut [u8], r: R) -> Result<&mut [u8], Error> {
+    let mut r = CRCReader::new(r);
 
-pub async fn read_frame<R: Read>(frame_buf: &mut [u8], mut r: R) -> Result<&mut [u8], Error> {
     let header = &mut frame_buf[0..PRE_PAYLOAD_BYTE_COUNT];
     r.read_exact(header).await.map_err(ReadExactErrorWrapper)?;
-    info!("{:?}", &header);
 
     let payload_length = PayloadLength::from_le_bytes([header[3], header[4]]) as usize;
     if payload_length > MAX_PAYLOAD_LENGTH {
         return Err(Error::InvalidLength);
     }
-    let total_length = PRE_PAYLOAD_BYTE_COUNT + payload_length + CRC_BYTE_COUNT;
-    // r.read_exact(&mut frame_buf[PRE_PAYLOAD_BYTE_COUNT..total_length])
-    //     .await
-    //     .map_err(ReadExactErrorWrapper)?;
 
-    let mut buf = &mut frame_buf[PRE_PAYLOAD_BYTE_COUNT..total_length];
-    while !buf.is_empty() {
-        info!("{:?}", &buf);
-        match r.read(buf).await {
-            Ok(0) => break,
-            Ok(n) => buf = &mut buf[n..],
-            Err(e) => return Err(Error::TODO),
-        }
-    }
+    let total_length = PRE_PAYLOAD_BYTE_COUNT + payload_length + CRC_BYTE_COUNT;
+    r.read_exact(&mut frame_buf[PRE_PAYLOAD_BYTE_COUNT..(total_length - CRC_BYTE_COUNT)])
+        .await
+        .map_err(ReadExactErrorWrapper)?;
+
+    r.read_crc(&mut frame_buf[(total_length - CRC_BYTE_COUNT)..total_length])
+        .await?;
 
     Ok(&mut frame_buf[0..total_length])
 }
@@ -351,23 +283,11 @@ where
     Txd: Write,
 {
     let frame = read_frame(frame_buf, &mut rx_upstream).await?;
-    debug!("device read frame: {:?}", frame);
 
     let Ok(t) = MessageType::try_from(frame[0]) else {
         error!("No message type for: {}", frame[0]);
-        // TODO: should I abort here or just fall through assuming address and payload follow, then let rest of message get forwarded?
         return Err(Error::BadMessageType);
     };
-
-    //////////////////////
-    //  check CRC
-
-    let crc_offset = frame.len() - CRC_BYTE_COUNT;
-    let expected = CRC.checksum(&frame[0..crc_offset]).to_le_bytes();
-    if &frame[crc_offset..] != expected {
-        error!("Bad message CRC");
-        return Err(Error::CRC);
-    }
 
     /////////////////
     // handle address
@@ -382,14 +302,10 @@ where
         frame[1..=2].copy_from_slice(&address.to_le_bytes())
     }
 
+    let crc_offset = frame.len() - CRC_BYTE_COUNT;
     let payload = &mut frame[PRE_PAYLOAD_BYTE_COUNT..crc_offset];
 
     use MessageType::*;
-    #[derive(Debug)]
-    enum WriteDirection {
-        Upstream,
-        Downstream,
-    }
     use WriteDirection::*;
 
     ///////////////////////////////
@@ -426,7 +342,7 @@ where
                 .get_mut((pdi_offset.0 as usize)..(pdi_offset.0 as usize + command_buf.len()))
             else {
                 error!("process update payload length smaller than pdi_offset + pdi_window_size");
-                return Err(Error::TODO);
+                return Err(Error::InvalidPDIOffset);
             };
 
             // Read command, write status
@@ -685,7 +601,7 @@ mod test {
                 (counter::Counter {}).pdi_window_size(),
                 |status, cmd: &[u8]| {
                     if let Some(cmd) =
-                        postcard::from_bytes::<Option<counter::Command>>(&cmd).unwrap()
+                        postcard::from_bytes::<Option<counter::Command>>(cmd).unwrap()
                     {
                         let old = postcard::from_bytes::<counter::Status>(status).unwrap();
                         match (old, cmd) {
@@ -704,8 +620,7 @@ mod test {
                 c_u_tx,
                 (echoer::Echoer {}).pdi_window_size(),
                 |status, cmd: &[u8]| {
-                    if let Some(cmd) =
-                        postcard::from_bytes::<Option<echoer::Command>>(&cmd).unwrap()
+                    if let Some(cmd) = postcard::from_bytes::<Option<echoer::Command>>(cmd).unwrap()
                     {
                         let new = match cmd {
                             echoer::Command::SetValue(v) => echoer::Status::ValueSet(v),

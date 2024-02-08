@@ -1,8 +1,11 @@
 use embedded_io_async::{Read, Write};
+use eui::*;
 use log::*;
-use ucat::controller::*;
-
-use ucat::*;
+use ucat::{
+    controller::*,
+    device::led::{Color, Led, Light},
+    MAX_FRAME_SIZE,
+};
 
 ////////////////////////////////////////
 // Paperwork to use serial port async
@@ -36,10 +39,6 @@ impl Write for Port {
     }
 }
 
-use eui::*;
-
-use ucat::device::led::{Color, Led, Light};
-
 pub fn main() -> anyhow::Result<()> {
     #[eui]
     struct Foo {}
@@ -49,7 +48,7 @@ pub fn main() -> anyhow::Result<()> {
     struct C {
         a: Light,
         b: Light,
-    };
+    }
 
     impl Status for Foo {}
     impl Command for C {}

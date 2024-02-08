@@ -3,7 +3,7 @@
 #[macro_export]
 macro_rules! default_device_impl {
     ($struct: ident, $command: ident, $status: ident) => {
-        impl crate::Device for $struct {
+        impl $crate::Device for $struct {
             type Command = $command;
             type Status = $status;
 
@@ -58,7 +58,7 @@ pub mod led {
         }
 
         fn status(&self, pdi_window: &[u8]) -> Self::Status {
-            postcard::from_bytes(&pdi_window).unwrap()
+            postcard::from_bytes(pdi_window).unwrap()
         }
 
         fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command) {
@@ -96,7 +96,7 @@ pub mod temp_sensor {
         }
 
         fn status(&self, pdi_window: &[u8]) -> Self::Status {
-            postcard::from_bytes(&pdi_window).unwrap()
+            postcard::from_bytes(pdi_window).unwrap()
         }
 
         fn command(&self, pdi_window: &mut [u8], cmd: &Self::Command) {

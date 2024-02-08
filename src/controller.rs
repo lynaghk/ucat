@@ -1,73 +1,6 @@
-pub use crate::MAX_FRAME_SIZE;
 use crate::*;
 use core::{marker::PhantomData, ops::Range};
 use log::*;
-
-pub async fn wait_for<R>(mut r: R, bs: &[u8]) -> Result<(), Error>
-where
-    R: Read,
-{
-    // TODO: something smarter than putting max frame on the stack just to compare equality later.
-    // presumably some kind of chunked read?
-    let n = bs.len();
-    let mut buf = [0u8; MAX_FRAME_SIZE];
-
-    // TODO: better error conversion here?
-    r.read_exact(&mut buf[..n])
-        .await
-        .map_err(ReadExactErrorWrapper::from)?;
-
-    if bs != &buf[..n] {
-        debug!("Expected: {bs:?}\nGot: {buf:?}");
-        return Err(Error::UnexpectedResponse);
-    }
-
-    Ok(())
-}
-
-pub async fn try_parse_frame<R>(mut r: R, buf: &mut [u8]) -> Result<Frame, Error>
-where
-    R: Read,
-{
-    r.read_exact(&mut buf[0..PRE_PAYLOAD_BYTE_COUNT])
-        .await
-        .map_err(ReadExactErrorWrapper::from)?;
-
-    match MessageType::try_from(buf[0]) {
-        Err(e) => {
-            error!("Bad message type: {}", e);
-            return Err(crate::Error::BadMessageType.into());
-        }
-        Ok(message_type) => {
-            let address = DeviceOrGroupAddressOnWire::from_le_bytes([buf[1], buf[2]]);
-            let payload_length = PayloadLength::from_le_bytes([buf[3], buf[4]]) as usize;
-
-            r.read_exact(
-                &mut buf[PRE_PAYLOAD_BYTE_COUNT
-                    ..(PRE_PAYLOAD_BYTE_COUNT + payload_length + CRC_BYTE_COUNT)],
-            )
-            .await
-            .map_err(ReadExactErrorWrapper::from)?;
-
-            let payload = &buf[PRE_PAYLOAD_BYTE_COUNT..(PRE_PAYLOAD_BYTE_COUNT + payload_length)];
-            let received_crc = &buf[(PRE_PAYLOAD_BYTE_COUNT + payload_length)
-                ..(PRE_PAYLOAD_BYTE_COUNT + payload_length + CRC_BYTE_COUNT)];
-
-            let crc = CRC.checksum(&buf[0..(PRE_PAYLOAD_BYTE_COUNT + payload_length)]);
-
-            if received_crc != crc.to_le_bytes() {
-                return Err(crate::Error::CRC);
-            }
-
-            Ok(Frame {
-                message_type,
-                address,
-                payload,
-                crc,
-            })
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct NetworkDevice<D, const GROUP: usize> {
@@ -171,7 +104,7 @@ where
         payload[..size_of::<GroupAddress>()].copy_from_slice(&group_address.0.to_le_bytes());
         payload[size_of::<GroupAddress>()..].copy_from_slice(&pdi_offset.0.to_le_bytes());
 
-        write_frame2(
+        write_frame(
             &mut self.port,
             MessageType::Initialize,
             address.to_wire_address(),
@@ -181,7 +114,7 @@ where
 
         // TODO: check device identity / version
         let mut buf = [0; FRAME_SIZE_INITIALIZE];
-        controller::try_parse_frame(&mut self.port, &mut buf).await?;
+        read_frame(&mut buf, &mut self.port).await?;
 
         Ok(d)
     }
@@ -201,13 +134,15 @@ where
         &mut self,
         pdi: PDI<'b, Pending, GROUP>,
     ) -> Result<PDI<'b, Cycled, GROUP>, Error> {
-        write_frame2(
+        write_frame(
             &mut self.port,
             MessageType::ProcessUpdate,
             GroupAddress(GROUP as u16).to_wire_address(),
-            &pdi.buf[..],
+            pdi.buf,
         )
         .await?;
+
+        // Not using read_frame here so that we can 1) break faster on unexpected data and 2) use distinct PDI buffer
 
         let mut r = CRCReader::new(&mut self.port);
         let mut buf = [0u8; PRE_PAYLOAD_BYTE_COUNT];
@@ -219,7 +154,7 @@ where
         match MessageType::try_from(buf[0]) {
             Err(e) => {
                 error!("Bad message type: {}", e);
-                return Err(crate::Error::BadMessageType);
+                Err(crate::Error::BadMessageType)
             }
             Ok(MessageType::ProcessUpdate) => {
                 let address = DeviceOrGroupAddressOnWire::from_le_bytes([buf[1], buf[2]]);
@@ -229,23 +164,22 @@ where
 
                 let payload_length = PayloadLength::from_le_bytes([buf[3], buf[4]]) as usize;
                 if payload_length != pdi.buf.len() {
-                    return Err(Error::PDILengthMismatch);
+                    return Err(Error::UnexpectedResponse);
                 }
 
                 r.read_exact(pdi.buf)
                     .await
                     .map_err(ReadExactErrorWrapper::from)?;
 
-                r.read_crc().await?;
+                let mut crc_buf = [0; CRC_BYTE_COUNT];
+                r.read_crc(&mut crc_buf).await?;
 
                 Ok(PDI {
                     state: PhantomData::<Cycled>,
                     buf: pdi.buf,
                 })
             }
-            Ok(_t) => {
-                return Err(Error::UnexpectedResponse);
-            }
+            Ok(_t) => Err(Error::UnexpectedResponse),
         }
     }
 }

@@ -87,9 +87,9 @@ pub enum DeviceState {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-enum WriteDirection {
-    Upstream,
-    Downstream,
+pub enum Reply<'a> {
+    Upstream(&'a [u8]),
+    Downstream(&'a [u8]),
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq, num_enum::TryFromPrimitive)]
@@ -237,12 +237,6 @@ pub async fn write_frame<W: Write>(
     Ok(())
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Action<'out> {
-    NewState(DeviceState),
-    NewCommand(&'out [u8]),
-}
-
 /// Read full frame into frame_buf, checking CRC.
 pub async fn read_frame<R: Read>(frame_buf: &mut [u8], r: R) -> Result<&mut [u8], Error> {
     let mut r = CRCReader::new(r);
@@ -267,23 +261,13 @@ pub async fn read_frame<R: Read>(frame_buf: &mut [u8], r: R) -> Result<&mut [u8]
 }
 
 /// Reference implementation of frame handling logic.
-/// Introduces substantial latency --- buffers entire frame in memory before sending.
-pub async fn handle_frame<'command, 'frame, Rxu, Txu, Txd>(
-    state: DeviceState,
+/// frame_buf must contain a  valid frame
+pub fn handle_frame<'command, 'frame>(
+    state: &mut DeviceState,
     latest_status: &[u8],
     command_buf: &'command mut [u8],
-    frame_buf: &'frame mut [u8],
-    mut rx_upstream: Rxu,
-    mut tx_upstream: Txu,
-    mut tx_downstream: Txd,
-) -> Result<Option<Action<'command>>, Error>
-where
-    Rxu: Read,
-    Txu: Write,
-    Txd: Write,
-{
-    let frame = read_frame(frame_buf, &mut rx_upstream).await?;
-
+    frame: &'frame mut [u8],
+) -> Result<(Reply<'frame>, Option<&'command [u8]>), Error> {
     let Ok(t) = MessageType::try_from(frame[0]) else {
         error!("No message type for: {}", frame[0]);
         return Err(Error::BadMessageType);
@@ -306,12 +290,15 @@ where
     let payload = &mut frame[PRE_PAYLOAD_BYTE_COUNT..crc_offset];
 
     use MessageType::*;
-    use WriteDirection::*;
-
+    enum ReplyDirection {
+        Upstream,
+        Downstream,
+    }
+    use ReplyDirection::*;
     ///////////////////////////////
     // message-specific handling
 
-    let (write_direction, action) = match (t, address, &state) {
+    let (reply_direction, command) = match (t, address, &state) {
         (Identify, 0, _) => todo!(),
         (Query, 0, _) => todo!(),
 
@@ -319,12 +306,12 @@ where
             // payload is group address, pdi offset
             let group_address = GroupAddress::from_le_bytes([payload[0], payload[1]]);
             let pdi_offset = PDIOffset::from_le_bytes([payload[2], payload[3]]);
-            let new_state = DeviceState::Initialized {
+            *state = DeviceState::Initialized {
                 group_address,
                 pdi_offset,
             };
-            info!("initialized: {new_state:?}");
-            (Upstream, Some(Action::NewState(new_state)))
+            info!("initialized: {state:?}");
+            (Upstream, None)
         }
 
         (
@@ -352,16 +339,16 @@ where
             pdi_window.copy_from_slice(latest_status);
             debug!("process update wrote: {pdi_window:?}");
 
-            let action = if command_buf.iter().all(|b| *b == 0) {
+            let command = if command_buf.iter().all(|b| *b == 0) {
                 None
             } else {
-                Some(Action::NewCommand(command_buf))
+                Some(&*command_buf)
             };
 
             let end_of_group = pdi_window.as_ptr_range().end == payload.as_ptr_range().end;
             debug!("end of group: {}", end_of_group);
-            let write_direction = if end_of_group { Upstream } else { Downstream };
-            (write_direction, action)
+            let reply_direction = if end_of_group { Upstream } else { Downstream };
+            (reply_direction, command)
         }
 
         (Initialize | Identify | Query | ProcessUpdate, _, _) => {
@@ -374,15 +361,12 @@ where
     let new_crc = CRC.checksum(&frame[0..crc_offset]).to_le_bytes();
     frame[crc_offset..].copy_from_slice(&new_crc);
 
-    /////////////////////////////////////
-    //write frame upstream or downstream
-    info!("{:?}", write_direction);
-    match write_direction {
-        Upstream => tx_upstream.write_all(frame).await?,
-        Downstream => tx_downstream.write_all(frame).await?,
-    }
+    let reply = match reply_direction {
+        Upstream => Reply::Upstream(frame),
+        Downstream => Reply::Downstream(frame),
+    };
 
-    Ok(action)
+    Ok((reply, command))
 }
 
 #[cfg(test)]
@@ -477,32 +461,27 @@ mod test {
         let mut latest_status = vec![0u8; pdi_window_size];
         let mut command_buf = vec![0u8; pdi_window_size];
         let mut frame_buf = vec![0u8; MAX_FRAME_SIZE];
+
         loop {
             if rx_upstream.read_ready().unwrap() {
-                let result = handle_frame(
-                    state.clone(),
-                    &latest_status,
-                    &mut command_buf,
-                    &mut frame_buf,
-                    &mut rx_upstream,
-                    &mut tx_upstream,
-                    &mut tx_downstream,
-                )
-                .await;
+                let frame = read_frame(&mut frame_buf[..], &mut rx_upstream)
+                    .await
+                    .unwrap();
+                let result = handle_frame(&mut state, &latest_status, &mut command_buf, frame);
 
-                match result {
-                    Ok(None) => {}
-                    Ok(Some(action)) => match action {
-                        Action::NewState(s) => state = s,
-                        Action::NewCommand(cmd) => cb(&mut latest_status[..], cmd),
-                    },
-                    // Err(Error::IO(_)) => {
-                    //     return;
-                    // }
-                    Err(e) => {
-                        error!("Unexpected device error: {e:?}");
-                        return;
-                    }
+                let Ok((reply, command)) = result else {
+                    let e = result.unwrap_err();
+                    error!("Unexpected device error: {e:?}");
+                    return;
+                };
+
+                if let Some(cmd) = command {
+                    cb(&mut latest_status[..], cmd)
+                }
+
+                match reply {
+                    Reply::Upstream(f) => tx_upstream.write_all(f).await.unwrap(),
+                    Reply::Downstream(f) => tx_downstream.write_all(f).await.unwrap(),
                 }
             }
 

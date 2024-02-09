@@ -184,7 +184,7 @@ parsing options:
   
 ## Log
 
-### Feb 6/7/8 - Refactor protocol, simplify reference implementation
+### Feb 6/7/8/9 - Refactor protocol, simplify reference implementation
 
 Decided to change protocol so devices reply directly when possible rather than always forwarding messages to the end of the chain.
 This lets us eliminate the "ping upstream on startup" behavior, which should make things more robust / less stateful moving forward --- the controller should be able to detect failures via timeouts and reconfigure as needed.
@@ -222,6 +222,16 @@ The core issue is that I have two distinct tasks:
 - handling from downstream
 
 both need a reference to upstream TX, and I want to await on both simultaneously.
+
+I resolved this by turning `handle_frame` into a non-async function which returns a Reply enum indiciating which direction the result should be sent.
+This allows the caller to juggle the shared refrences.
+
+The same problem exists with having a single frame buffer shared between upstream and downstream handling.
+In the esp32s3 implementation I just made two buffers =(
+
+Measuring via logic analyzer it takes about 700us for the response to start coming out on the wire
+This strikes me as an absurd amount of time for the esp32s3 running at 240 MHz, given that the handle frame function should just be doing a few copies of 10s of bytes.
+I wonder if this is the esp-hal async machinery.
 
 ### Feb 2 - API design
 

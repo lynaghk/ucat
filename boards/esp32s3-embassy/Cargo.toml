@@ -24,7 +24,6 @@ embassy-sync       = "0.5"
 
 smart-leds = "0.4"
 bbqueue = "0.5"
-futures = { version = "0.3", default-features = false }
 static_cell = { version = "2.0.0", features = ["nightly"] }
 embassy-futures = "0.1.1"
 

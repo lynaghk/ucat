@@ -2,9 +2,10 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
-use embassy_futures::yield_now;
+use embassy_futures::select::select3;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
-use embassy_time::{Duration, Timer};
+use embassy_time::Timer;
+use embedded_io_async::Write;
 use esp32s3_hal::{
     clock::ClockControl,
     embassy,
@@ -13,6 +14,9 @@ use esp32s3_hal::{
     Uart, IO,
 };
 use esp_backtrace as _;
+
+#[allow(unused)]
+use esp_println::dbg;
 
 use log::*;
 use static_cell::make_static;
@@ -40,125 +44,82 @@ type Command = <DeviceType as Device>::Command;
 
 #[embassy_executor::task]
 async fn comms(
-    mut upstream: Uart<'static, UpstreamUart>,
-    mut downstream: Uart<'static, DownstreamUart>,
+    upstream: Uart<'static, UpstreamUart>,
+    downstream: Uart<'static, DownstreamUart>,
     status: StatusSignal,
     command: CommandSignal,
 ) {
     let mut state = DeviceState::Reset;
-    let mut status_buf = [0u8; PDI_WINDOW_SIZE];
-    let mut command_buf = [0u8; PDI_WINDOW_SIZE];
-    let mut frame_buf = [0u8; MAX_FRAME_SIZE];
-
     let mut last_status = status.wait().await;
 
-    macro_rules! rx_available {
-        ($uart: ident) => {{
+    let mut status_buf = [0u8; PDI_WINDOW_SIZE];
+    let mut command_buf = [0u8; PDI_WINDOW_SIZE];
 
-            // This seems to return the right count for upstream uart, but always has 1 for the downstream uart.
-            // If that's noise, I'm not sure why the read doesn't clear it when it times out and the future gets cancelled.
-            let count: u16 = $uart::register_block()
-                .status()
-                .read()
-                .rxfifo_cnt()
-                .bits()
-                .into();
-            //info!("rx {count}");
-            count != 0
+    // Ideally we would only need one buffer since there's only ever one message on the network at a time.
+    // However, I couldn't find a nice way to convince the borrow checker of this --- I'd love to simply await upstream and downstream read futures, but they can't share a mutable reference.
+    let mut upstream_rx_buf = [0u8; MAX_FRAME_SIZE];
+    let mut downstream_rx_buf = [0u8; MAX_FRAME_SIZE];
 
-            // $uart::register_block()
-            //     .fsm_status()
-            //     .read()
-            //     .st_urx_out()
-            //     .bits()
-            //     != 0x0u8
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    let (mut downstream_tx, mut downstream_rx) = downstream.split();
 
-
-        }};
-    }
-
-    let upstream_rx_available = || rx_available!(UpstreamUart);
-    let downstream_rx_available = || rx_available!(DownstreamUart);
-
-    // TODO: use rx idle timeout interrupt rather than embassy timeout here.
-    let timeout = Duration::from_millis(500);
-    //let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    // sometimes noise gets into the uart buffers after startup, so just dump them.
+    while upstream_rx.read().is_ok() {}
+    while downstream_rx.read().is_ok() {}
 
     loop {
-        // TODO: refactor so handle_frame can use most recent status buffer when it's writing out to PDI?
-        // Status gets "stale" while waiting for PDI.
+        // Serialize latest status message
         if status.signaled() {
             last_status = status.wait().await;
         }
         postcard::to_slice(&last_status, &mut status_buf).unwrap();
 
-        // TODO: use async select with cancel-safe ReadReady traits on uarts so we can
-        // (or just use DMA for upstream forwarding, if possible)
+        // TODO: use rx idle timeout interrupt rather than embassy timeout here.
+        let timeout = Timer::after_millis(500);
+        let upstream_frame = read_frame(&mut upstream_rx_buf, &mut upstream_rx);
+        let downstream_frame = read_frame(&mut downstream_rx_buf, &mut downstream_rx);
+        use embassy_futures::select::Either3::*;
 
-        if upstream_rx_available() {
-            let f = handle_frame(
-                state.clone(),
-                &status_buf,
-                &mut command_buf,
-                &mut frame_buf,
-                &mut upstream_rx,
-                &mut upstream_tx,
-                &mut downstream,
-            );
-
-            let Ok(result) = embassy_time::with_timeout(timeout, f).await else {
-                error!("Timed out waiting for upstream message");
+        match select3(timeout, upstream_frame, downstream_frame).await {
+            First(_) => {
+                error!("Timed out waiting for messages");
                 continue;
-            };
-
-            match result {
+            }
+            Second(x) => match x {
                 Err(e) => {
-                    error!("Unexpected device error: {e:?}");
+                    error!("upstream frame error: {e:?}");
                     continue;
                 }
-                Ok(None) => {}
-                Ok(Some(action)) => match action {
-                    Action::NewState(s) => state = s,
-                    Action::NewCommand(cmd) => {
+                Ok(upstream_frame) => {
+                    let result =
+                        handle_frame(&mut state, &status_buf, &mut command_buf, upstream_frame);
+
+                    let Ok((reply, maybe_command)) = result else {
+                        let e = result.unwrap_err();
+                        error!("Error handling frame: {e:?}");
+                        continue;
+                    };
+
+                    match reply {
+                        Reply::Upstream(f) => upstream_tx.write_all(f).await.unwrap(),
+                        Reply::Downstream(f) => downstream_tx.write_all(f).await.unwrap(),
+                    }
+
+                    if let Some(cmd) = maybe_command {
                         if let Some(cmd) = postcard::from_bytes::<Option<Command>>(&cmd).unwrap() {
                             command.signal(cmd)
                         }
                     }
-                },
-            }
+                }
+            },
+            Third(x) => match x {
+                Err(e) => {
+                    error!("downstream frame error: {e:?}");
+                    continue;
+                }
+                Ok(downstream_frame) => upstream_tx.write_all(downstream_frame).await.unwrap(),
+            },
         }
-
-        if downstream_rx_available() {
-            info!("forwarding upstream...");
-            let f = read_frame(&mut frame_buf, &mut downstream);
-            let Ok(frame) = embassy_time::with_timeout(timeout, f).await else {
-                error!("Timed out waiting for downstream message");
-                continue;
-            };
-
-            embedded_io_async::Write::write_all(&mut upstream_tx, frame.unwrap())
-                .await
-                .unwrap();
-            info!("forwarded upstream");
-        }
-
-        // TODO: investigate likely esp hal bug: when downstream_rx_available() I can blocking read a byte but future read never resolves.
-        // while upstream_rx_available() {
-        //     info!("upstream: {:?}", upstream.read().unwrap());
-        // }
-        // while downstream_rx_available() {
-        //     info!("reading downstream...");
-        //     //info!("downstream: {:?}", downstream.read().unwrap());
-
-        //     let mut buf = [0; 1];
-        //     embedded_io_async::Read::read_exact(&mut downstream, &mut buf)
-        //         .await
-        //         .unwrap();
-        //     info!("downstream: {:?}", buf);
-        // }
-
-        // yield so this loop doesn't starve CPU.
-        yield_now().await;
     }
 }
 
@@ -201,8 +162,8 @@ async fn main(spawner: embassy_executor::Spawner) {
             peripherals.UART2,
             config,
             Some(TxRxPins::new_tx_rx(
-                io.pins.gpio19.into_push_pull_output(),
-                io.pins.gpio20.into_floating_input(),
+                io.pins.gpio13.into_push_pull_output(),
+                io.pins.gpio12.into_floating_input(),
             )),
             &clocks,
         );

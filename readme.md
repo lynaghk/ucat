@@ -1,5 +1,12 @@
 # ucat: A cheap and cheerful modular hardware system.
 
+Note: This is a personal research project only.
+See discussion and background context in [my newsletter article](https://kevinlynagh.com/newsletter/2024_02_rustrations/).
+
+You should probably just use CAN.
+
+## Background
+
 I'm aware of two ways to throw together electromechanical systems:
 
 1. microcontrollers with I2C / SPI breakout boards (cheap, but tedious), and
@@ -20,6 +27,7 @@ design goals:
   - JLCPCB's cheapest 32-bit MCU (the $0.48 stm32g030) should be able to act as a device OR controller
 - suitable for < 1 W power applications (e.g., powered by USB powerbank and solar)
 - latency should scale linearly with IO
+
 
 
 ## Example
